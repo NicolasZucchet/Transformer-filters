@@ -39,11 +39,13 @@ def main():
     key, subkey = jax.random.split(key)
     A, C = generate_system_parameters(subkey, args.dim_x, args.dim_y, args.lambda_val, bool(args.diagonal_A))
     
+    generate_sequences_jit = jax.jit(generate_sequences, static_argnums=(1, 2))
+
     # 2. Estimate Kalman Filter Baseline Variance
     key, subkey = jax.random.split(key)
     val_T = 1024
     val_bs = 128
-    val_xs, val_ys = generate_sequences(subkey, val_bs, val_T, A, C, args.sigma)
+    val_xs, val_ys = generate_sequences_jit(subkey, val_bs, val_T, A, C, args.sigma)
     
     # Prepare KF args
     if jnp.iscomplexobj(A):
@@ -91,7 +93,7 @@ def main():
     start_time = time.time()
     for step in range(args.steps):
         key, subkey = jax.random.split(key)
-        xs, ys = generate_sequences(subkey, args.batch_size, args.seq_len, A, C, args.sigma)
+        xs, ys = generate_sequences_jit(subkey, args.batch_size, args.seq_len, A, C, args.sigma)
         
         state, loss = train_step(state, ys)
         
@@ -121,7 +123,7 @@ def main():
         if i % 5 == 0:
             print(f"Eval chunk {i}/{n_chunks}")
         key, subkey = jax.random.split(key)
-        xs_eval, ys_eval = generate_sequences(subkey, eval_batch_size, 128, A, C, args.sigma)
+        xs_eval, ys_eval = generate_sequences_jit(subkey, eval_batch_size, 128, A, C, args.sigma)
         
         warmup = ys_eval[:, :64]
         truth = ys_eval[:, 64:]
