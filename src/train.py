@@ -11,6 +11,7 @@ import time
 from src.data import generate_system_parameters, generate_sequences
 from src.model import TransformerFilter
 from src.kalman import kalman_filter, kalman_filter_final_state
+from src.eval import evaluate_model
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -101,73 +102,12 @@ def main():
     print(f"Training finished in {time.time() - start_time:.2f}s")
 
     # 5. Evaluation (Rollout)
-    print("Starting evaluation...")
-    n_eval = args.n_eval
-    eval_batch_size = 256
-    n_chunks = max(1, n_eval // eval_batch_size)
+    evaluate_model(
+        model, state.params, A, C, args.sigma, KF_A, KF_C, KF_Q, 
+        args.seed, args.n_eval, 256, seq_len=128, warmup_len=64, 
+        patch_size=args.patch_size
+    )
     
-    horizons = [2, 4, 8, 16, 32, 64]
-    model_errors = {h: [] for h in horizons}
-    kf_errors = {h: [] for h in horizons}
-    
-    get_final_state = jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None))
-    
-    @jax.jit
-    def predict_next_patch(params, seq):
-        preds = model.apply({'params': params}, seq, train=False)
-        return preds[:, -args.patch_size:]
-    
-    for i in range(n_chunks):
-        if i % 5 == 0:
-            print(f"Eval chunk {i}/{n_chunks}")
-        key, subkey = jax.random.split(key)
-        xs_eval, ys_eval = generate_sequences(subkey, eval_batch_size, 128, A, C, args.sigma)
-        
-        warmup = ys_eval[:, :64]
-        truth = ys_eval[:, 64:]
-        
-        x_last = get_final_state(warmup, KF_A, KF_C, KF_Q)
-        
-        kf_preds_rollout = []
-        x_curr = x_last
-        
-        for _ in range(64):
-            x_curr = x_curr @ KF_A.T 
-            y_pred = x_curr @ KF_C.T 
-            kf_preds_rollout.append(y_pred[:, None, :])
-            
-        kf_rollout = jnp.concatenate(kf_preds_rollout, axis=1)
-        
-        current_seq = warmup
-        predictions = []
-        steps_generated = 0
-        
-        while steps_generated < 64:
-            next_patch = predict_next_patch(state.params, current_seq)
-            predictions.append(next_patch)
-            current_seq = jnp.concatenate([current_seq, next_patch], axis=1)
-            steps_generated += args.patch_size
-            
-        all_preds = jnp.concatenate(predictions, axis=1)
-        all_preds = all_preds[:, :64]
-        
-        for h in horizons:
-            idx = h - 1 
-            if idx < 64:
-                m_err = jnp.mean(jnp.square(all_preds[:, idx] - truth[:, idx]), axis=-1)
-                k_err = jnp.mean(jnp.square(kf_rollout[:, idx] - truth[:, idx]), axis=-1)
-                
-                model_errors[h].extend(m_err.tolist())
-                kf_errors[h].extend(k_err.tolist())
-                
-    for h in horizons:
-        mean_model = np.mean(model_errors[h])
-        mean_kf = np.mean(kf_errors[h])
-        ratio = mean_model / mean_kf
-        
-        wandb.log({f"eval/score_t+{h}": ratio})
-        print(f"t+{h}: Ratio={ratio:.4f} (Model={mean_model:.4f}, KF={mean_kf:.4f})")
-        
     wandb.finish()
 
 if __name__ == "__main__":

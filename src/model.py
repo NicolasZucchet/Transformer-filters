@@ -1,12 +1,12 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Optional
+from typing import Optional, Any, Tuple, List
 
 class CausalRevIN(nn.Module):
     epsilon: float = 1e-5
     
-    def __call__(self, x, inverse: bool = False, mean=None, var=None):
+    def __call__(self, x, inverse: bool = False, mean=None, var=None, return_state: bool = False):
         # x: (Batch, T, D)
         if not inverse:
             # Compute causal mean and variance
@@ -25,16 +25,54 @@ class CausalRevIN(nn.Module):
             stdev = jnp.sqrt(var + self.epsilon)
             
             x_norm = (x - mean) / stdev
+            
+            if return_state:
+                # State for incremental updates after this sequence
+                # (count, sum_x, sum_sq_x) at the END of the sequence
+                # These must be (Batch, 1, D)
+                count = jnp.full((x.shape[0], 1, 1), x.shape[1], dtype=x.dtype)
+                sum_x = cum_sum[:, -1:, :]
+                sum_sq_x = cum_sq_sum[:, -1:, :]
+                state = (count, sum_x, sum_sq_x)
+                return x_norm, mean, stdev, state
+            
             return x_norm, mean, stdev
         else:
             # Inverse
             assert mean is not None and var is not None
             return x * var + mean # var here is passed as stdev
 
+    def forward_incremental(self, x_t, state):
+        # x_t: (Batch, 1, D)
+        # state: (count, sum_x, sum_sq_x)
+        # Returns: x_norm_t, new_state, mean_t, stdev_t
+        
+        count, sum_x, sum_sq_x = state
+        
+        count = count + 1
+        sum_x = sum_x + x_t
+        sum_sq_x = sum_sq_x + x_t**2
+        
+        mean = sum_x / count
+        var = (sum_sq_x / count) - mean**2
+        var = jnp.maximum(var, 0.0)
+        stdev = jnp.sqrt(var + self.epsilon)
+        
+        x_norm = (x_t - mean) / stdev
+        
+        return x_norm, (count, sum_x, sum_sq_x), mean, stdev
+        
+    def init_state(self, batch_size, dim, dtype=jnp.float32):
+        return (
+            jnp.zeros((batch_size, 1, 1), dtype=dtype), # count
+            jnp.zeros((batch_size, 1, dim), dtype=dtype), # sum_x
+            jnp.zeros((batch_size, 1, dim), dtype=dtype)  # sum_sq_x
+        )
+
 class RotaryEmbedding(nn.Module):
     dim: int
     
-    def __call__(self, x):
+    def __call__(self, x, offset=0):
         # x: (Batch, Seq, Heads, Dim)
         b, s, h, d = x.shape
         half_dim = d // 2
@@ -43,7 +81,7 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (10000 ** (jnp.arange(0, half_dim, dtype=jnp.float32) / half_dim))
         
         # Positions
-        pos = jnp.arange(s, dtype=jnp.float32)
+        pos = jnp.arange(offset, offset + s, dtype=jnp.float32)
         
         # Outer product
         freqs = jnp.einsum('i,j->ij', pos, inv_freq) # (Seq, HalfDim)
@@ -69,6 +107,60 @@ class RotaryEmbedding(nn.Module):
         
         return (x * cos) + (x_rotated * sin)
 
+class CausalAttention(nn.Module):
+    d_model: int
+    n_heads: int
+    
+    @nn.compact
+    def __call__(self, x, mask=None, cache=None, pos_offset=0, return_cache=False):
+        # x: (B, T, D)
+        b, t, d = x.shape
+        head_dim = self.d_model // self.n_heads
+        
+        q = nn.Dense(self.d_model)(x)
+        k = nn.Dense(self.d_model)(x)
+        v = nn.Dense(self.d_model)(x)
+        
+        q = q.reshape(b, t, self.n_heads, head_dim)
+        k = k.reshape(b, t, self.n_heads, head_dim)
+        v = v.reshape(b, t, self.n_heads, head_dim)
+        
+        # RoPE
+        rope = RotaryEmbedding(head_dim)
+        q = rope(q, offset=pos_offset)
+        k = rope(k, offset=pos_offset)
+        
+        # Cache logic
+        if cache is not None:
+            k_cache, v_cache = cache
+            k = jnp.concatenate([k_cache, k], axis=1)
+            v = jnp.concatenate([v_cache, v], axis=1)
+            new_cache = (k, v)
+        elif return_cache:
+            new_cache = (k, v)
+        else:
+            new_cache = None
+            
+        # Attention
+        # q: (B, T, H, D)
+        # k: (B, S, H, D) where S >= T
+        
+        logits = jnp.einsum('bthd,bshd->bhts', q, k)
+        logits = logits / jnp.sqrt(head_dim)
+        
+        if mask is not None:
+            # mask: (B, 1, T, S)
+            # Ensure mask broadcasts correctly
+            logits += mask
+            
+        weights = nn.softmax(logits, axis=-1)
+        out = jnp.einsum('bhts,bshd->bthd', weights, v)
+        out = out.reshape(b, t, self.d_model)
+        
+        out = nn.Dense(self.d_model)(out)
+        
+        return out, new_cache
+
 class TransformerFilter(nn.Module):
     d_model: int = 256
     n_layers: int = 4
@@ -77,80 +169,67 @@ class TransformerFilter(nn.Module):
     dim_y: int = 2
     
     @nn.compact
-    def __call__(self, x, train: bool = True):
+    def __call__(self, x, train: bool = True, cache=None, revin_state=None, pos_offset=0):
         # x: (Batch, T, dim_y)
         b, t, d = x.shape
+        revin = CausalRevIN()
+        
+        return_cache = (cache is not None)
         
         # 1. Causal RevIN
-        revin = CausalRevIN()
-        x_norm, mean, stdev = revin(x)
+        if revin_state is None:
+            # Full sequence mode (Prefill or Train)
+            if return_cache:
+                x_norm, mean, stdev, new_revin_state = revin(x, return_state=True)
+            else:
+                x_norm, mean, stdev = revin(x)
+                new_revin_state = None
+        else:
+            # Incremental mode (Decode)
+            # x is (B, 1, D)
+            x_norm, new_revin_state, mean, stdev = revin.forward_incremental(x, revin_state)
         
         # 2. Patching
-        # Pad if T not divisible by patch_size?
-        # Assume T is divisible.
         p = self.patch_size
-        assert t % p == 0, f"Sequence length {t} must be divisible by patch size {p}"
-        
-        num_patches = t // p
-        x_patched = x_norm.reshape(b, num_patches, p * d)
+        if revin_state is None:
+            assert t % p == 0, f"Sequence length {t} must be divisible by patch size {p}"
+            num_patches = t // p
+            x_patched = x_norm.reshape(b, num_patches, p * d)
+        else:
+            # Incremental: x_norm is (B, p, D) 
+            x_patched = x_norm.reshape(b, 1, p * d)
+            num_patches = 1
         
         # 3. Projection
         h = nn.Dense(self.d_model)(x_patched)
         
-        # 4. Transformer with RoPE
-        rope = RotaryEmbedding(self.d_model // self.n_heads)
+        # 4. Transformer
+        # Mask creation
+        if revin_state is None:
+            # Full causal mask
+            mask = nn.make_causal_mask(jnp.ones((b, num_patches)), dtype=bool)
+            mask_bias = jnp.where(mask, 0., -1e9)
+        else:
+            # Decoding: Attending to all past (cached) + current
+            # No masking needed as we attend to everything available
+            mask_bias = None
         
-        # Mask for causality
-        mask = nn.make_causal_mask(jnp.ones((b, num_patches)), dtype=bool)
+        new_caches = []
         
-        for _ in range(self.n_layers):
-            # Attention
-            # Norm
+        for i in range(self.n_layers):
             h_norm = nn.LayerNorm()(h)
             
-            # MultiHeadAttention
-            # We need to inject RoPE into Q, K
-            # Flax MHA doesn't expose Q, K easily for modification unless we subclass.
-            # OR we compute RoPE outside?
-            # Flax MHA allows `q_k_v_features`.
+            # Get cache for this layer
+            # If cache is passed (as list), use it. If list contains Nones, it's prefill.
+            layer_cache = cache[i] if (cache is not None and cache[i] is not None) else None
             
-            # Let's use a manual attention block or look for a way to inject pos encoding.
-            # Alternatively, apply RoPE to h before attention? No, RoPE is relative.
-            # It must be on q, k.
+            attn = CausalAttention(self.d_model, self.n_heads)
+            h_attn, new_layer_cache = attn(h_norm, mask=mask_bias, cache=layer_cache, pos_offset=pos_offset, return_cache=return_cache)
             
-            # Simple implementation of MHA block with RoPE
-            # Q, K, V projections
-            q = nn.Dense(self.d_model)(h_norm)
-            k = nn.Dense(self.d_model)(h_norm)
-            v = nn.Dense(self.d_model)(h_norm)
-            
-            # Reshape (B, T, H, D)
-            q = q.reshape(b, num_patches, self.n_heads, self.d_model // self.n_heads)
-            k = k.reshape(b, num_patches, self.n_heads, self.d_model // self.n_heads)
-            v = v.reshape(b, num_patches, self.n_heads, self.d_model // self.n_heads)
-            
-            # RoPE
-            q = rope(q)
-            k = rope(k)
-            
-            # Attention
-            logits = jnp.einsum('bthd,bshd->bhts', q, k)
-            logits = logits / jnp.sqrt(q.shape[-1])
-            
-            # Mask
-            # mask: (B, 1, T, T)
-            # logits: (B, H, T, T)
-            mask_bias = jnp.where(mask, 0., -1e9)
-            logits += mask_bias
-            
-            weights = nn.softmax(logits, axis=-1)
-            out = jnp.einsum('bhts,bshd->bthd', weights, v)
-            out = out.reshape(b, num_patches, self.d_model)
-            
-            # Output proj
-            out = nn.Dense(self.d_model)(out)
-            
-            h = h + out
+            if new_layer_cache is not None:
+                new_caches.append(new_layer_cache)
+                
+            h = h + h_attn
             
             # FFN
             h_norm = nn.LayerNorm()(h)
@@ -163,18 +242,25 @@ class TransformerFilter(nn.Module):
         output = nn.Dense(p * d)(h)
         
         # 6. Unpatch
-        output = output.reshape(b, t, d)
+        output = output.reshape(b, -1, d)
         
         # 7. Denormalize
-        # We need to use the stats used for input.
-        # But wait. If we predict y_{t+1}, we should use stats available at t?
-        # The output at step `t` (patch `k`) is prediction for `patch k+1`?
-        # Standard causal transformer: Output at pos `t` predicts `t+1`.
-        # So `output` contains predictions.
-        # We denormalize using the SAME stats `mean`, `stdev` because the network worked in normalized space.
-        # The target is `x_norm` shifted.
-        # Or we denormalize to get `y_hat` and compare with `y` shifted.
-        
         y_hat = revin(output, inverse=True, mean=mean, var=stdev)
         
-        return y_hat
+        if return_cache:
+            return y_hat, new_caches, new_revin_state
+        else:
+            return y_hat
+            
+    def init_cache(self, batch_size, seq_len):
+        # This is hard because we don't know the full length upfront for pre-allocation if we were using static arrays.
+        # But JAX handles dynamic shapes in lists/tuples okay-ish or we just start with empty.
+        # Ideally, we start with None or empty arrays.
+        # But for JIT, shapes must be known.
+        # Let's return a structure of zeros.
+        
+        # Actually, standard way is to start with initialized dummy cache.
+        # Or simpler: The first call to generate creates the cache.
+        pass
+
+
