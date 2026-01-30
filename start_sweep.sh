@@ -90,6 +90,8 @@ echo "Sweep ID: $SWEEP_ID"
 # 2. Connect to server, update code, and launch jobs
 echo "Launching $NUMBER_JOBS agents on $SERVER_HOST for sweep $SWEEP_ID..."
 
+REMOTE_VENV="/cluster/scratch/nzucchet/${WORKSPACE_DIR}/.venv"
+
 # Create the job script locally
 cat << EOF > agent_job.sh
 #!/bin/bash
@@ -102,7 +104,8 @@ cat << EOF > agent_job.sh
 # Ensure we are in the workspace
 cd ~/$WORKSPACE_DIR
 
-source .venv/bin/activate
+source $REMOTE_VENV/bin/activate
+export PYTHONPATH=$PYTHONPATH:.
 
 # Dynamic LD_LIBRARY_PATH setup for JAX/NVIDIA
 export LD_LIBRARY_PATH=\$(python -c 'import os, glob, sysconfig; print(":".join(glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia/*/lib"))))'):\$LD_LIBRARY_PATH
@@ -123,8 +126,13 @@ rm agent_job.sh
 REMOTE_CMD="cd ~/$WORKSPACE_DIR && \
     git pull && \
     export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH\" && \
+    export UV_CACHE_DIR=\"/cluster/scratch/nzucchet/.uv_cache\" && \
+    export UV_PROJECT_ENVIRONMENT=\"$REMOTE_VENV\" && \
+    mkdir -p \"\$(dirname \"$REMOTE_VENV\")\" && \
     (command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh) && \
     uv sync && \
+    source \"$REMOTE_VENV/bin/activate\" && \
+    uv pip install -U \"jax[cuda12]\" && \
     sbatch --array=1-${NUMBER_JOBS} --job-name='${SWEEP_CONFIG##*/}' agent_job.sh"
 
 echo "Executing remote command on $SERVER_HOST..."

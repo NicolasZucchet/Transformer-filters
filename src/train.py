@@ -55,7 +55,7 @@ def main():
         KF_C = C
         KF_Q = args.sigma
         
-    kf_filter_vmap = jax.vmap(kalman_filter, in_axes=(0, None, None, None))
+    kf_filter_vmap = jax.jit(jax.vmap(kalman_filter, in_axes=(0, None, None, None)))
     kf_preds, kf_stats = kf_filter_vmap(val_ys, KF_A, KF_C, KF_Q)
     kf_err = val_ys - kf_preds
     kf_mse = jnp.mean(jnp.square(kf_err)[:, 64:])
@@ -110,7 +110,7 @@ def main():
     model_errors = {h: [] for h in horizons}
     kf_errors = {h: [] for h in horizons}
     
-    get_final_state = jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None))
+    get_final_state = jax.jit(jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None)))
     
     @jax.jit
     def predict_next_patch(params, seq):
