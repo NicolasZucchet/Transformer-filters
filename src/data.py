@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import random
+from functools import partial
 
 def generate_system_parameters(key, dim_x, dim_y, lambda_val, diagonal=False):
     k1, k2, k3, k4 = random.split(key, 4)
@@ -61,6 +62,7 @@ def generate_system_parameters(key, dim_x, dim_y, lambda_val, diagonal=False):
         
     return A, C
 
+@partial(jax.jit, static_argnums=(1, 2))
 def generate_sequences(key, batch_size, T, A, C, noise_std):
     # A, C can be real or complex
     dim_x = A.shape[0]

@@ -39,13 +39,11 @@ def main():
     key, subkey = jax.random.split(key)
     A, C = generate_system_parameters(subkey, args.dim_x, args.dim_y, args.lambda_val, bool(args.diagonal_A))
     
-    generate_sequences_jit = jax.jit(generate_sequences, static_argnums=(1, 2))
-
     # 2. Estimate Kalman Filter Baseline Variance
     key, subkey = jax.random.split(key)
     val_T = 1024
     val_bs = 128
-    val_xs, val_ys = generate_sequences_jit(subkey, val_bs, val_T, A, C, args.sigma)
+    val_xs, val_ys = generate_sequences(subkey, val_bs, val_T, A, C, args.sigma)
     
     # Prepare KF args
     if jnp.iscomplexobj(A):
@@ -57,7 +55,7 @@ def main():
         KF_C = C
         KF_Q = args.sigma
         
-    kf_filter_vmap = jax.jit(jax.vmap(kalman_filter, in_axes=(0, None, None, None)))
+    kf_filter_vmap = jax.vmap(kalman_filter, in_axes=(0, None, None, None))
     kf_preds, kf_stats = kf_filter_vmap(val_ys, KF_A, KF_C, KF_Q)
     kf_err = val_ys - kf_preds
     kf_mse = jnp.mean(jnp.square(kf_err)[:, 64:])
@@ -93,7 +91,7 @@ def main():
     start_time = time.time()
     for step in range(args.steps):
         key, subkey = jax.random.split(key)
-        xs, ys = generate_sequences_jit(subkey, args.batch_size, args.seq_len, A, C, args.sigma)
+        xs, ys = generate_sequences(subkey, args.batch_size, args.seq_len, A, C, args.sigma)
         
         state, loss = train_step(state, ys)
         
@@ -112,7 +110,7 @@ def main():
     model_errors = {h: [] for h in horizons}
     kf_errors = {h: [] for h in horizons}
     
-    get_final_state = jax.jit(jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None)))
+    get_final_state = jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None))
     
     @jax.jit
     def predict_next_patch(params, seq):
@@ -123,7 +121,7 @@ def main():
         if i % 5 == 0:
             print(f"Eval chunk {i}/{n_chunks}")
         key, subkey = jax.random.split(key)
-        xs_eval, ys_eval = generate_sequences_jit(subkey, eval_batch_size, 128, A, C, args.sigma)
+        xs_eval, ys_eval = generate_sequences(subkey, eval_batch_size, 128, A, C, args.sigma)
         
         warmup = ys_eval[:, :64]
         truth = ys_eval[:, 64:]
