@@ -17,7 +17,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lambda_val", type=float, default=0.9)
-    parser.add_argument("--diagonal_A", type=int, default=0) # 0 or 1
+    parser.add_argument("--structure", type=str, default="dense", choices=["dense", "diagonal", "scalar"])
     parser.add_argument("--patch_size", type=int, default=1)
     parser.add_argument("--dim_x", type=int, default=64)
     parser.add_argument("--dim_y", type=int, default=2)
@@ -38,7 +38,7 @@ def main():
     
     # 1. Generate System
     key, subkey = jax.random.split(key)
-    A, C = generate_system_parameters(subkey, args.dim_x, args.dim_y, args.lambda_val, bool(args.diagonal_A))
+    A, C = generate_system_parameters(subkey, args.dim_x, args.dim_y, args.lambda_val, args.structure)
     
     # 2. Estimate Kalman Filter Baseline Variance
     key, subkey = jax.random.split(key)

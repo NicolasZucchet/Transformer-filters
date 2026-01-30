@@ -5,8 +5,8 @@ metric:
   name: eval/score_t+64
   goal: minimize
 parameters:
-  diagonal_A:
-    values: [0, 1]
+  structure:
+    values: [dense, diagonal, scalar]
   lambda_val:
     values: [0.84, 0.92, 0.98]
   patch_size:

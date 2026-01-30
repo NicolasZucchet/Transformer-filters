@@ -7,8 +7,8 @@ metric:
 parameters:
   patch_size:
     values: [1, 8, 32]
-  diagonal_A:
-    values: [0, 1]
+  structure:
+    value: dense
   lambda_val:
     values: [0.84, 0.92, 0.98]
   dim_y:
