@@ -43,24 +43,49 @@ class CausalRevIN(nn.Module):
             return x * var + mean # var here is passed as stdev
 
     def forward_incremental(self, x_t, state):
-        # x_t: (Batch, 1, D)
-        # state: (count, sum_x, sum_sq_x)
-        # Returns: x_norm_t, new_state, mean_t, stdev_t
+        # x_t: (Batch, P, D)
+        # state: (count, sum_x, sum_sq_x) each (Batch, 1, D)
+        # Returns: x_norm_t (Batch, P, D), new_state (Batch, 1, D), mean_t (Batch, P, D), stdev_t (Batch, P, D)
         
         count, sum_x, sum_sq_x = state
         
-        count = count + 1
-        sum_x = sum_x + x_t
-        sum_sq_x = sum_sq_x + x_t**2
+        # We need to compute running statistics for each token in the patch
+        # Cumulative sums over the patch dimension (axis 1)
+        # x_t shape: (B, P, D)
         
-        mean = sum_x / count
-        var = (sum_sq_x / count) - mean**2
+        patch_size = x_t.shape[1]
+        
+        # Incremental counts: count + 1, count + 2, ..., count + P
+        # count is (B, 1, 1). arange is (P).
+        counts_incr = jnp.arange(1, patch_size + 1, dtype=x_t.dtype).reshape(1, -1, 1)
+        current_counts = count + counts_incr # (B, P, 1) broadcast
+        
+        # Cumulative sums
+        cumsum_x = jnp.cumsum(x_t, axis=1) # (B, P, D)
+        cumsum_sq_x = jnp.cumsum(x_t**2, axis=1) # (B, P, D)
+        
+        current_sum_x = sum_x + cumsum_x
+        current_sum_sq_x = sum_sq_x + cumsum_sq_x
+        
+        # Compute means/vars for normalization
+        # Note: RevIN usually normalizes using stats up to t-1 to predict t?
+        # Standard implementation (Kim et al.) normalizes the input x_t using stats computed from x_t (and history).
+        # So we normalize x_t[i] using stats including x_t[i].
+        
+        mean = current_sum_x / current_counts
+        var = (current_sum_sq_x / current_counts) - mean**2
         var = jnp.maximum(var, 0.0)
         stdev = jnp.sqrt(var + self.epsilon)
         
         x_norm = (x_t - mean) / stdev
         
-        return x_norm, (count, sum_x, sum_sq_x), mean, stdev
+        # Update state to the final values of this patch
+        # Slice to keep (B, 1, D) dimensions
+        new_count = current_counts[:, -1:, :]
+        new_sum_x = current_sum_x[:, -1:, :]
+        new_sum_sq_x = current_sum_sq_x[:, -1:, :]
+        
+        return x_norm, (new_count, new_sum_x, new_sum_sq_x), mean, stdev
         
     def init_state(self, batch_size, dim, dtype=jnp.float32):
         return (
