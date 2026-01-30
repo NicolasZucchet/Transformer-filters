@@ -20,6 +20,25 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
     # Kalman Filter Helpers
     get_final_state = jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None))
     
+    # Calculate Cache Shapes
+    # warmup_len is in timesteps.
+    # We generate up to max horizon (64).
+    # Total needed: warmup + 64.
+    n_patches_warmup = warmup_len // patch_size
+    n_patches_gen = 64 // patch_size
+    max_patches = n_patches_warmup + n_patches_gen + 2 # Safety buffer
+    
+    head_dim = model.d_model // model.n_heads
+    
+    def init_cache_fn(bs):
+        cache = []
+        for _ in range(model.n_layers):
+            k = jnp.zeros((bs, max_patches, model.n_heads, head_dim))
+            v = jnp.zeros((bs, max_patches, model.n_heads, head_dim))
+            idx = jnp.array(0, dtype=jnp.int32)
+            cache.append((k, v, idx))
+        return cache
+    
     # 1. Prediction Function (Single Step with Cache)
     def predict_step(carry, _):
         # carry: (current_input_patch, cache, revin_state, pos_offset)
@@ -51,11 +70,14 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
     @jax.jit
     def generate_rollout(warmup_seq):
         # warmup_seq: (B, warmup_len, dim_y)
+        bs = warmup_seq.shape[0]
         
-        # 1. Prefill (Process warmup)
-        n_layers = model.n_layers
-        init_cache = [None] * n_layers
+        # 1. Init Cache
+        init_cache = init_cache_fn(bs)
         
+        # 2. Prefill (Process warmup)
+        # We pass the full fixed-size cache. 
+        # CausalAttention will update it from index 0.
         y_last_hat, cache, revin_state = model.apply(
             {'params': params},
             warmup_seq,
@@ -69,15 +91,14 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
         # Input to first generation step is the prediction for the step after warmup
         first_input = y_last_hat[:, -patch_size:, :]
         
-        # 2. Generate
-        # We need to generate up to max horizon (64 steps).
-        n_gen_patches = 64 // patch_size
-        start_pos_offset = warmup_len // patch_size
+        # 3. Generate
+        start_pos_offset = n_patches_warmup
         
         init_carry = (first_input, cache, revin_state, start_pos_offset)
         
         # Scan
-        _, gen_preds = jax.lax.scan(predict_step, init_carry, None, length=n_gen_patches)
+        # We generate n_patches_gen patches
+        _, gen_preds = jax.lax.scan(predict_step, init_carry, None, length=n_patches_gen)
         
         # gen_preds is (L, B, P, D) -> (B, L*P, D)
         gen_preds = jnp.transpose(gen_preds, (1, 0, 2, 3))

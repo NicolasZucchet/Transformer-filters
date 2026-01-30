@@ -81,7 +81,7 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (10000 ** (jnp.arange(0, half_dim, dtype=jnp.float32) / half_dim))
         
         # Positions
-        pos = jnp.arange(offset, offset + s, dtype=jnp.float32)
+        pos = jnp.arange(s, dtype=jnp.float32) + offset
         
         # Outer product
         freqs = jnp.einsum('i,j->ij', pos, inv_freq) # (Seq, HalfDim)
@@ -132,29 +132,84 @@ class CausalAttention(nn.Module):
         
         # Cache logic
         if cache is not None:
-            k_cache, v_cache = cache
-            k = jnp.concatenate([k_cache, k], axis=1)
-            v = jnp.concatenate([v_cache, v], axis=1)
-            new_cache = (k, v)
+            # Fixed size cache: (k_buffer, v_buffer, index)
+            k_buffer, v_buffer, index = cache
+            # k_buffer: (B, MaxT, H, D)
+            
+            # Update cache at index
+            # x is (B, T, D) -> k is (B, T, H, D)
+            # Update slice starts at (0, index, 0, 0)
+            # We assume T=1 for decode usually, or T>1 for prefill?
+            # dynamic_update_slice works for T>1 too.
+            
+            k_buffer = jax.lax.dynamic_update_slice(k_buffer, k, (0, index, 0, 0))
+            v_buffer = jax.lax.dynamic_update_slice(v_buffer, v, (0, index, 0, 0))
+            
+            new_index = index + t
+            new_cache = (k_buffer, v_buffer, new_index)
+            
+            # Attention
+            # Attend to [0, new_index)
+            # k_buffer has valid data up to new_index.
+            # We use the whole buffer as key/value.
+            
+            # Mask creation:
+            # We want mask[b, 1, t_q, t_k]
+            # t_q = T (current chunk)
+            # t_k = MaxT (buffer size)
+            # Valid if t_k < index + t_q?
+            # Standard causal: q at pos (index + i) attends to k at pos j if j <= index + i.
+            
+            max_len = k_buffer.shape[1]
+            # range for k: [0, max_len)
+            idx_k = jnp.arange(max_len)
+            # range for q: [index, index + T)
+            # Use jnp.arange(t) + index to avoid dynamic start in arange
+            idx_q = (jnp.arange(t) + index)[:, None] # (T, 1)
+            
+            # mask: 1 if idx_k <= idx_q else 0
+            # Broadcast to (1, 1, T, MaxT)
+            # And also mask out anything >= new_index (unwritten future)
+            # Actually idx_k <= idx_q handles idx_k < new_index implicitly because idx_q < new_index.
+            
+            causal_mask = (idx_k[None, :] <= idx_q) # (T, MaxT)
+            causal_mask = causal_mask[None, None, :, :] # (1, 1, T, MaxT)
+            
+            # Combine with provided mask if any (though usually None for decode)
+            if mask is not None:
+                # mask is (B, 1, T, T) usually? Or (B, 1, T, S)?
+                # If mask provided during decode, it might be tricky.
+                # Assuming no extra mask for now or mask matches shapes.
+                pass
+                
+            mask_bias = jnp.where(causal_mask, 0., -1e9)
+            
+            k_in = k_buffer
+            v_in = v_buffer
+            
         elif return_cache:
-            new_cache = (k, v)
+             # Just return what we computed, but we can't really "return cache" without a buffer.
+             # This path is problematic for fixed size.
+             # We expect the caller to PROVIDE the buffer if they want caching.
+             new_cache = None
+             k_in = k
+             v_in = v
+             mask_bias = mask # Use standard mask passed in
         else:
             new_cache = None
+            k_in = k
+            v_in = v
+            mask_bias = mask
             
         # Attention
-        # q: (B, T, H, D)
-        # k: (B, S, H, D) where S >= T
-        
-        logits = jnp.einsum('bthd,bshd->bhts', q, k)
+        logits = jnp.einsum('bthd,bshd->bhts', q, k_in)
         logits = logits / jnp.sqrt(head_dim)
         
-        if mask is not None:
-            # mask: (B, 1, T, S)
-            # Ensure mask broadcasts correctly
-            logits += mask
+        if mask_bias is not None:
+            logits += mask_bias
             
         weights = nn.softmax(logits, axis=-1)
-        out = jnp.einsum('bhts,bshd->bthd', weights, v)
+        out = jnp.einsum('bhts,bshd->bthd', weights, v_in)
         out = out.reshape(b, t, self.d_model)
         
         out = nn.Dense(self.d_model)(out)
@@ -169,12 +224,14 @@ class TransformerFilter(nn.Module):
     dim_y: int = 2
     
     @nn.compact
-    def __call__(self, x, train: bool = True, cache=None, revin_state=None, pos_offset=0):
+    def __call__(self, x, train: bool = True, cache=None, revin_state=None, pos_offset=0, return_cache=False):
         # x: (Batch, T, dim_y)
         b, t, d = x.shape
         revin = CausalRevIN()
         
-        return_cache = (cache is not None)
+        # Determine if we are returning cache (requires cache to be provided for fixed size)
+        # Actually, for "init", maybe we can't easily do it inside unless we allocate.
+        # We'll assume cache is provided if return_cache is True, OR we just handle the logic cleanly.
         
         # 1. Causal RevIN
         if revin_state is None:
@@ -205,13 +262,12 @@ class TransformerFilter(nn.Module):
         
         # 4. Transformer
         # Mask creation
-        if revin_state is None:
-            # Full causal mask
+        if revin_state is None and cache is None:
+            # Full causal mask (Training / No Cache)
             mask = nn.make_causal_mask(jnp.ones((b, num_patches)), dtype=bool)
             mask_bias = jnp.where(mask, 0., -1e9)
         else:
-            # Decoding: Attending to all past (cached) + current
-            # No masking needed as we attend to everything available
+            # If cache is provided (Prefill or Decode with fixed cache), CausalAttention handles masking.
             mask_bias = None
         
         new_caches = []
@@ -220,8 +276,7 @@ class TransformerFilter(nn.Module):
             h_norm = nn.LayerNorm()(h)
             
             # Get cache for this layer
-            # If cache is passed (as list), use it. If list contains Nones, it's prefill.
-            layer_cache = cache[i] if (cache is not None and cache[i] is not None) else None
+            layer_cache = cache[i] if cache is not None else None
             
             attn = CausalAttention(self.d_model, self.n_heads)
             h_attn, new_layer_cache = attn(h_norm, mask=mask_bias, cache=layer_cache, pos_offset=pos_offset, return_cache=return_cache)
