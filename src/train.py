@@ -28,7 +28,18 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--n_eval", type=int, default=8192)
     parser.add_argument("--wandb_project", type=str, default="Transformer-filters")
-    parser.add_argument("--remove_inverse_norm", action="store_true", help="If set, skip the inverse normalization at the end of the network.")
+    
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
+
+    parser.add_argument("--remove_inverse_norm", type=str2bool, default=False, help="If set, skip the inverse normalization at the end of the network.")
     return parser.parse_args()
 
 def main():
