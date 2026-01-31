@@ -247,6 +247,7 @@ class TransformerFilter(nn.Module):
     n_heads: int = 4
     patch_size: int = 1
     dim_y: int = 2
+    remove_inverse_norm: bool = False
     
     @nn.compact
     def __call__(self, x, train: bool = True, cache=None, revin_state=None, pos_offset=0, return_cache=False):
@@ -325,7 +326,10 @@ class TransformerFilter(nn.Module):
         output = output.reshape(b, -1, d)
         
         # 7. Denormalize
-        y_hat = revin(output, inverse=True, mean=mean, var=stdev)
+        if not self.remove_inverse_norm:
+            y_hat = revin(output, inverse=True, mean=mean, var=stdev)
+        else:
+            y_hat = output
         
         if return_cache:
             return y_hat, new_caches, new_revin_state

@@ -6,7 +6,7 @@ from functools import partial
 from src.data import generate_sequences
 from src.kalman import kalman_filter_final_state
 
-def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, batch_size, seq_len=128, warmup_len=64, patch_size=1, horizons=[2, 4, 8, 16, 32, 64]):
+def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, batch_size, seq_len=128, warmup_len=64, patch_size=1, horizons=[2, 4, 8, 16, 32, 64], step=None):
     """
     Evaluates model using efficient autoregressive generation with caching.
     """
@@ -149,10 +149,16 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
                 kf_errors[h].extend(k_err.tolist())
                 
     # Log Results
+    log_dict = {}
     for h in horizons:
         mean_model = np.mean(model_errors[h])
         mean_kf = np.mean(kf_errors[h])
         ratio = mean_model / mean_kf
         
-        wandb.log({f"eval/score_t+{h}": ratio})
+        log_dict[f"eval/score_t+{h}"] = ratio
         print(f"t+{h}: Ratio={ratio:.4f} (Model={mean_model:.4f}, KF={mean_kf:.4f})")
+    
+    if step is not None:
+        log_dict["step"] = step
+        
+    wandb.log(log_dict)

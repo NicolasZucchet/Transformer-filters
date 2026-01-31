@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--n_eval", type=int, default=8192)
     parser.add_argument("--wandb_project", type=str, default="Transformer-filters")
+    parser.add_argument("--remove_inverse_norm", action="store_true", help="If set, skip the inverse normalization at the end of the network.")
     return parser.parse_args()
 
 def main():
@@ -64,7 +65,7 @@ def main():
     wandb.log({"baseline_kf_mse": float(kf_mse)})
     
     # 3. Model Setup
-    model = TransformerFilter(patch_size=args.patch_size, dim_y=args.dim_y)
+    model = TransformerFilter(patch_size=args.patch_size, dim_y=args.dim_y, remove_inverse_norm=args.remove_inverse_norm)
     
     dummy_input = jnp.zeros((1, args.seq_len, args.dim_y))
     key, subkey = jax.random.split(key)
@@ -90,6 +91,9 @@ def main():
 
     print("Starting training...")
     start_time = time.time()
+    
+    eval_interval = max(1, args.steps // 4)
+    
     for step in range(args.steps):
         key, subkey = jax.random.split(key)
         xs, ys = generate_sequences(subkey, args.batch_size, args.seq_len, A, C, args.sigma)
@@ -99,14 +103,15 @@ def main():
         if step % 50 == 0:
             wandb.log({"train_loss": float(loss), "step": step})
             
+        if (step + 1) % eval_interval == 0:
+            print(f"Evaluating at step {step + 1}...")
+            evaluate_model(
+                model, state.params, A, C, args.sigma, KF_A, KF_C, KF_Q, 
+                args.seed, args.n_eval, 256, seq_len=128, warmup_len=64, 
+                patch_size=args.patch_size, step=step + 1
+            )
+            
     print(f"Training finished in {time.time() - start_time:.2f}s")
-
-    # 5. Evaluation (Rollout)
-    evaluate_model(
-        model, state.params, A, C, args.sigma, KF_A, KF_C, KF_Q, 
-        args.seed, args.n_eval, 256, seq_len=128, warmup_len=64, 
-        patch_size=args.patch_size
-    )
     
     wandb.finish()
 
