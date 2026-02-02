@@ -15,7 +15,7 @@ def analyze_debug_sweep(sweep_id):
     data = []
     
     # Define horizons to track
-    horizons = [2, 8, 64]
+    horizons = [2, 4, 8, 16, 32, 64]
     metric_keys = [f"eval/score_t+{h}" for h in horizons]
     keys_to_fetch = ["step"] + metric_keys
     
@@ -60,7 +60,7 @@ def analyze_debug_sweep(sweep_id):
     
     # Group by config and step, average over seeds
     group_cols = ["patch_size", "remove_inv", "step"]
-    df_avg = df.groupby(group_cols)[["t+2", "t+8", "t+64"]].mean().reset_index()
+    df_avg = df.groupby(group_cols)[["t+2", "t+4", "t+8", "t+16", "t+32", "t+64"]].mean().reset_index()
     
     # Sort
     df_avg = df_avg.sort_values(by=group_cols)
