@@ -12,13 +12,10 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
     """
     print("Starting evaluation...")
     
-    # Expand horizons to include 1..first_horizon
+    # Expand horizons to include all integers up to the max horizon
     if horizons:
-        first_h = horizons[0]
-        # Ensure we cover 1 to first_h-1
-        extra = list(range(1, first_h))
-        # Merge and sort unique horizons
-        eval_horizons = sorted(list(set(extra + horizons)))
+        max_h = max(horizons)
+        eval_horizons = list(range(1, max_h + 1))
     else:
         eval_horizons = []
     
