@@ -12,10 +12,20 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
     """
     print("Starting evaluation...")
     
+    # Expand horizons to include 1..first_horizon
+    if horizons:
+        first_h = horizons[0]
+        # Ensure we cover 1 to first_h-1
+        extra = list(range(1, first_h))
+        # Merge and sort unique horizons
+        eval_horizons = sorted(list(set(extra + horizons)))
+    else:
+        eval_horizons = []
+    
     num_eval_batches = max(1, n_eval // batch_size)
     
-    model_errors = {h: [] for h in horizons}
-    kf_errors = {h: [] for h in horizons}
+    model_errors = {h: [] for h in eval_horizons}
+    kf_errors = {h: [] for h in eval_horizons}
     
     # Kalman Filter Helpers
     get_final_state = jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None))
@@ -139,7 +149,7 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
         kf_rollout = jnp.concatenate(kf_preds_rollout, axis=1)
         
         # 3. Compute Metrics
-        for h in horizons:
+        for h in eval_horizons:
             idx = h - 1 
             if idx < 64:
                 m_err = jnp.mean(jnp.square(all_preds[:, idx] - truth[:, idx]), axis=-1)
@@ -150,15 +160,24 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
                 
     # Log Results
     log_dict = {}
-    for h in horizons:
+    table_data = []
+    columns = ["Horizon", "Score (Ratio)", "Model MSE", "KF MSE"]
+
+    for h in eval_horizons:
         mean_model = np.mean(model_errors[h])
         mean_kf = np.mean(kf_errors[h])
         ratio = mean_model / mean_kf
         
         log_dict[f"eval/score_t+{h}"] = ratio
         print(f"t+{h}: Ratio={ratio:.4f} (Model={mean_model:.4f}, KF={mean_kf:.4f})")
+        
+        table_data.append([h, ratio, mean_model, mean_kf])
     
     if step is not None:
         log_dict["step"] = step
+    
+    # Create and log table
+    table = wandb.Table(data=table_data, columns=columns)
+    log_dict["eval/detailed_table"] = table
         
     wandb.log(log_dict)
