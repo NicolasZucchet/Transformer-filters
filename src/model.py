@@ -253,88 +253,93 @@ class TransformerFilter(nn.Module):
     def __call__(self, x, train: bool = True, cache=None, revin_state=None, pos_offset=0, return_cache=False):
         # x: (Batch, T, dim_y)
         b, t, d = x.shape
+        p = self.patch_size
         revin = CausalRevIN()
         
-        # Determine if we are returning cache (requires cache to be provided for fixed size)
-        # Actually, for "init", maybe we can't easily do it inside unless we allocate.
-        # We'll assume cache is provided if return_cache is True, OR we just handle the logic cleanly.
-        
-        # 1. Causal RevIN
+        # 1. Causal RevIN & Patching
         if revin_state is None:
             # Full sequence mode (Prefill or Train)
-            if return_cache:
-                x_norm, mean, stdev, new_revin_state = revin(x, return_state=True)
-            else:
-                x_norm, mean, stdev = revin(x)
-                new_revin_state = None
-        else:
-            # Incremental mode (Decode)
-            # x is (B, 1, D)
-            x_norm, new_revin_state, mean, stdev = revin.forward_incremental(x, revin_state)
-        
-        # 2. Patching
-        p = self.patch_size
-        if revin_state is None:
-            assert t % p == 0, f"Sequence length {t} must be divisible by patch size {p}"
+            x_norm, mean, stdev, new_revin_state = revin(x, return_state=True)
             num_patches = t // p
             x_patched = x_norm.reshape(b, num_patches, p * d)
+            
+            # Prepend zero patch for causality: h[i] sees patches 0..i-1
+            zero_patch = jnp.zeros((b, 1, p * d), dtype=x.dtype)
+            x_patched_in = jnp.concatenate([zero_patch, x_patched], axis=1) # (B, N+1, P*D)
+            
+            # Stats for denormalization:
+            # Patch i uses stats from end of patch i-1.
+            indices = jnp.arange(num_patches + 1) * p - 1
+            mean_padded = jnp.concatenate([jnp.zeros((b, 1, d)), mean], axis=1)
+            stdev_padded = jnp.concatenate([jnp.ones((b, 1, d)), stdev], axis=1)
+            
+            patch_means = mean_padded[:, indices + 1, :]
+            patch_stdevs = stdev_padded[:, indices + 1, :]
+            num_patches_in = num_patches + 1
         else:
-            # Incremental: x_norm is (B, p, D) 
-            x_patched = x_norm.reshape(b, 1, p * d)
-            num_patches = 1
+            # Incremental mode (Decode)
+            # x is the "current" patch. Transformer sees it and predicts the NEXT patch.
+            x_norm, new_revin_state, mean, stdev = revin.forward_incremental(x, revin_state)
+            x_patched_in = x_norm.reshape(b, 1, p * d)
+            
+            # Use current stats to denormalize the prediction for the NEXT patch
+            patch_means = mean[:, -1:, :]
+            patch_stdevs = stdev[:, -1:, :]
+            num_patches_in = 1
         
-        # 3. Projection
-        h = nn.Dense(self.d_model)(x_patched)
+        # 2. Projection
+        h = nn.Dense(self.d_model)(x_patched_in)
         
-        # 4. Transformer
-        # Mask creation
+        # 3. Transformer
         if revin_state is None and cache is None:
-            # Full causal mask (Training / No Cache)
-            mask = nn.make_causal_mask(jnp.ones((b, num_patches)), dtype=bool)
+            mask = nn.make_causal_mask(jnp.ones((b, num_patches_in)), dtype=bool)
             mask_bias = jnp.where(mask, 0., -1e9)
         else:
-            # If cache is provided (Prefill or Decode with fixed cache), CausalAttention handles masking.
             mask_bias = None
         
         new_caches = []
-        
         for i in range(self.n_layers):
             h_norm = nn.LayerNorm()(h)
-            
-            # Get cache for this layer
             layer_cache = cache[i] if cache is not None else None
-            
             attn = CausalAttention(self.d_model, self.n_heads)
             h_attn, new_layer_cache = attn(h_norm, mask=mask_bias, cache=layer_cache, pos_offset=pos_offset, return_cache=return_cache)
-            
             if new_layer_cache is not None:
                 new_caches.append(new_layer_cache)
-                
             h = h + h_attn
-            
-            # FFN
             h_norm = nn.LayerNorm()(h)
             ff = nn.Dense(self.d_model * 4)(h_norm)
             ff = nn.gelu(ff)
             ff = nn.Dense(self.d_model)(ff)
             h = h + ff
             
-        # 5. Output Head
-        output = nn.Dense(p * d)(h)
+        # 4. Output Head
+        output = nn.Dense(p * d)(h) # (B, num_patches_in, P*D)
         
-        # 6. Unpatch
-        output = output.reshape(b, -1, d)
+        # 5. Denormalize
+        output_reshaped = output.reshape(b, -1, p, d)
+        patch_means_exp = patch_means[:, :, None, :]
+        patch_stdevs_exp = patch_stdevs[:, :, None, :]
         
-        # 7. Denormalize
         if not self.remove_inverse_norm:
-            y_hat = revin(output, inverse=True, mean=mean, var=stdev)
+            y_hat_reshaped = output_reshaped * patch_stdevs_exp + patch_means_exp
         else:
-            y_hat = output
+            y_hat_reshaped = output_reshaped
         
-        if return_cache:
-            return y_hat, new_caches, new_revin_state
+        y_hat = y_hat_reshaped.reshape(b, -1, d)
+        
+        # 6. Return
+        if revin_state is None:
+            if return_cache:
+                # Return everything including the future patch for prefill
+                return y_hat, new_caches, new_revin_state
+            else:
+                # Return predictions for y[1...T]
+                # preds[t] predicts y[t+1]
+                # y_hat has length T + p
+                return y_hat[:, 1:t+1, :]
         else:
-            return y_hat
+            # In incremental mode, y_hat is the prediction for the NEXT patch
+            return y_hat, new_caches, new_revin_state
             
     def init_cache(self, batch_size, seq_len):
         # This is hard because we don't know the full length upfront for pre-allocation if we were using static arrays.

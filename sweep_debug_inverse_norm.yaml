@@ -1,0 +1,28 @@
+name: "Debug: Inverse Norm"
+method: grid
+command:
+  - "uv"
+  - "run"
+  - "-m"
+  - "src.train"
+  - ${args}
+metric:
+  name: eval/score_t+64
+  goal: minimize
+parameters:
+  patch_size:
+    values: [1, 2, 4, 8]
+  lambda_val:
+    value: 0.98
+  remove_inverse_norm:
+    values: [true, false]
+  steps:
+    value: 8000
+  structure:
+    value: dense
+  dim_y:
+    value: 2
+  seed:
+    values: [0, 1]
+  lr:
+    values: [0.001, 0.0003, 0.0001]

@@ -95,23 +95,34 @@ def evaluate_model(model, params, A, C, sigma, KF_A, KF_C, KF_Q, seed, n_eval, b
             return_cache=True
         )
         
-        # Input to first generation step is the prediction for the step after warmup
+        # Input to first generation step is the prediction for the first future patch
+        # y_last_hat has length warmup_len + patch_size
         first_input = y_last_hat[:, -patch_size:, :]
         
         # 3. Generate
-        start_pos_offset = n_patches_warmup
+        # We used n_patches_warmup + 1 patches (zero + warmup)
+        start_pos_offset = n_patches_warmup + 1
         
         init_carry = (first_input, cache, revin_state, start_pos_offset)
         
         # Scan
-        # We generate n_patches_gen patches
-        _, gen_preds = jax.lax.scan(predict_step, init_carry, None, length=n_patches_gen)
+        # We generate n_patches_gen - 1 additional patches
+        # (Since first_input is already the first generated patch)
+        patches_to_gen = n_patches_gen - 1
         
-        # gen_preds is (L, B, P, D) -> (B, L*P, D)
-        gen_preds = jnp.transpose(gen_preds, (1, 0, 2, 3))
-        gen_preds = gen_preds.reshape(gen_preds.shape[0], -1, gen_preds.shape[3])
+        if patches_to_gen > 0:
+            _, gen_preds = jax.lax.scan(predict_step, init_carry, None, length=patches_to_gen)
+            
+            # gen_preds is (L, B, P, D) -> (B, L*P, D)
+            gen_preds = jnp.transpose(gen_preds, (1, 0, 2, 3))
+            gen_preds = gen_preds.reshape(gen_preds.shape[0], -1, gen_preds.shape[3])
+            
+            # Concatenate first_input and subsequent predictions
+            all_preds = jnp.concatenate([first_input, gen_preds], axis=1)
+        else:
+            all_preds = first_input
         
-        return gen_preds
+        return all_preds
 
     key = jax.random.PRNGKey(seed)
     
