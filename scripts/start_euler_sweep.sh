@@ -140,4 +140,3 @@ echo "REMINDER: Please ensure you have committed and pushed your latest changes 
 ssh "$SERVER_HOST" "$REMOTE_CMD"
 
 echo "Jobs submitted on $SERVER_HOST."
-

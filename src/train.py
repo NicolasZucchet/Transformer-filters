@@ -1,130 +1,152 @@
-import argparse
+"""Training utilities and training loop."""
+from typing import Any, Callable
+from functools import partial
 import jax
 import jax.numpy as jnp
 import optax
 import flax.linen as nn
 from flax.training import train_state
-import wandb
-import numpy as np
-import time
+from src.config import Config, TrainConfig
 
-from src.data import generate_system_parameters, generate_sequences
-from src.model import TransformerFilter
-from src.kalman import kalman_filter, kalman_filter_final_state
-from src.eval import evaluate_model
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--lambda_val", type=float, default=0.9)
-    parser.add_argument("--structure", type=str, default="dense", choices=["dense", "diagonal", "scalar"])
-    parser.add_argument("--patch_size", type=int, default=1)
-    parser.add_argument("--dim_x", type=int, default=64)
-    parser.add_argument("--dim_y", type=int, default=2)
-    parser.add_argument("--sigma", type=float, default=1.0)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--seq_len", type=int, default=256)
-    parser.add_argument("--n_eval", type=int, default=8192)
-    parser.add_argument("--wandb_project", type=str, default="Transformer-filters")
-    
-    def str2bool(v):
-        if isinstance(v, bool):
-            return v
-        if v.lower() in ('yes', 'true', 't', 'y', '1'):
-            return True
-        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-            return False
-        else:
-            raise argparse.ArgumentTypeError('Boolean value expected.')
+class TrainState(train_state.TrainState):
+    """Training state with additional RNG field."""
+    rng: jax.Array
 
-    parser.add_argument("--remove_inverse_norm", type=str2bool, default=False, help="If set, skip the inverse normalization at the end of the network.")
-    return parser.parse_args()
 
-def main():
-    args = parse_args()
-    wandb.init(project=args.wandb_project, config=vars(args))
-    
-    key = jax.random.PRNGKey(args.seed)
-    
-    # 1. Generate System
-    key, subkey = jax.random.split(key)
-    A, C = generate_system_parameters(subkey, args.dim_x, args.dim_y, args.lambda_val, args.structure)
-    
-    # 2. Estimate Kalman Filter Baseline Variance
-    key, subkey = jax.random.split(key)
-    val_T = 1024
-    val_bs = 128
-    val_xs, val_ys = generate_sequences(subkey, val_bs, val_T, A, C, args.sigma)
-    
-    # Prepare KF args
-    if jnp.iscomplexobj(A):
-        KF_A = jnp.block([[A.real, -A.imag], [A.imag, A.real]])
-        KF_C = jnp.block([[C.real, -C.imag]])
-        KF_Q = args.sigma / jnp.sqrt(2)
+def create_optimizer(train_config: TrainConfig) -> optax.GradientTransformation:
+    """Create optimizer with warmup + cosine decay and gradient clipping."""
+    # Warmup + cosine decay schedule
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0,
+        end_value=train_config.learning_rate,
+        transition_steps=train_config.warmup_steps,
+    )
+    cosine_fn = optax.cosine_decay_schedule(
+        init_value=train_config.learning_rate,
+        decay_steps=max(1, train_config.total_steps - train_config.warmup_steps),
+    )
+    schedule = optax.join_schedules(
+        schedules=[warmup_fn, cosine_fn],
+        boundaries=[train_config.warmup_steps],
+    )
+
+    return optax.chain(
+        optax.clip_by_global_norm(train_config.grad_clip),
+        optax.adamw(learning_rate=schedule, weight_decay=train_config.weight_decay),
+    )
+
+
+def create_train_state(
+    model: nn.Module,
+    config: Config,
+    rng: jax.Array,
+    dataset: Any,
+    optimizer: optax.GradientTransformation,
+) -> TrainState:
+    """Initialize parameters and create train state."""
+    rng, init_rng = jax.random.split(rng)
+
+    # Create dummy input based on task type
+    if config.data.task_type == "bigram":
+        dummy_input = jnp.ones((1, config.data.sequence_length), dtype=jnp.int32)
+    elif config.data.task_type == "lds":
+        dummy_input = jnp.ones((1, config.data.sequence_length, config.data.dim_y), dtype=jnp.float32)
     else:
-        KF_A = A
-        KF_C = C
-        KF_Q = args.sigma
-        
-    kf_filter_vmap = jax.vmap(kalman_filter, in_axes=(0, None, None, None))
-    kf_preds, kf_stats = kf_filter_vmap(val_ys, KF_A, KF_C, KF_Q)
-    kf_err = val_ys - kf_preds
-    kf_mse = jnp.mean(jnp.square(kf_err)[:, 64:])
-    print(f"Baseline KF MSE: {kf_mse}")
-    wandb.log({"baseline_kf_mse": float(kf_mse)})
-    
-    # 3. Model Setup
-    model = TransformerFilter(patch_size=args.patch_size, dim_y=args.dim_y, remove_inverse_norm=args.remove_inverse_norm)
-    
-    dummy_input = jnp.zeros((1, args.seq_len, args.dim_y))
-    key, subkey = jax.random.split(key)
-    variables = model.init(subkey, dummy_input)
-    
-    tx = optax.adamw(learning_rate=args.lr)
-    state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
-    
-    # 4. Training Loop
-    @jax.jit
-    def train_step(state, batch_y):
-        def loss_fn(params):
-            preds = model.apply({'params': params}, batch_y)
-            preds_aligned = preds[:, :-1]
-            targets_aligned = batch_y[:, 1:]
-            
-            loss = jnp.mean(jnp.square(preds_aligned - targets_aligned))
-            return loss / kf_mse
-            
-        loss, grads = jax.value_and_grad(loss_fn)(state.params)
-        state = state.apply_gradients(grads=grads)
-        return state, loss
+        raise ValueError(f"Unknown task_type: {config.data.task_type}")
 
-    print("Starting training...")
-    start_time = time.time()
-    
-    eval_interval = max(1, args.steps // 4)
-    
-    for step in range(args.steps):
-        key, subkey = jax.random.split(key)
-        xs, ys = generate_sequences(subkey, args.batch_size, args.seq_len, A, C, args.sigma)
-        
-        state, loss = train_step(state, ys)
-        
-        if step % 50 == 0:
-            wandb.log({"train_loss": float(loss), "step": step})
-            
-        if (step + 1) % eval_interval == 0:
-            print(f"Evaluating at step {step + 1}...")
-            evaluate_model(
-                model, state.params, A, C, args.sigma, KF_A, KF_C, KF_Q, 
-                args.seed, args.n_eval, 256, seq_len=128, warmup_len=64, 
-                patch_size=args.patch_size, step=step + 1
-            )
-            
-    print(f"Training finished in {time.time() - start_time:.2f}s")
-    
-    wandb.finish()
+    init_rngs = {"params": init_rng, "dropout": init_rng}
+    variables = model.init(init_rngs, dummy_input, deterministic=True)
+    params = variables["params"]
 
-if __name__ == "__main__":
-    main()
+    return TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=optimizer,
+        rng=rng,
+    )
+
+
+@partial(jax.jit, static_argnums=(2,))
+def train_step(
+    state: TrainState,
+    batch: dict,
+    loss_fn: Callable,
+) -> tuple[TrainState, dict]:
+    """Single training step. loss_fn is a static argument for JIT."""
+    dropout_rng = jax.random.fold_in(state.rng, state.step)
+
+    def compute_loss(params):
+        logits = state.apply_fn(
+            {"params": params}, batch["inputs"],
+            deterministic=False, rngs={"dropout": dropout_rng},
+        )
+        loss = loss_fn(logits, batch["targets"], batch["mask"])
+        # Apply loss_scale for gradient scaling (e.g. 1/kf_mse for LDS)
+        loss_scale = batch.get("loss_scale", 1.0)
+        return loss * loss_scale
+
+    loss, grads = jax.value_and_grad(compute_loss)(state.params)
+    new_state = state.apply_gradients(grads=grads)
+
+    return new_state, {"loss": loss}
+
+
+@partial(jax.jit, static_argnums=(0,))
+def eval_forward(apply_fn, params, inputs):
+    """JIT-compiled forward pass for evaluation."""
+    return apply_fn({"params": params}, inputs, deterministic=True)
+
+
+def eval_model(state: TrainState, dataset, config: Config) -> dict:
+    """Evaluate model on dataset (teacher-forced)."""
+    rng = jax.random.PRNGKey(0)
+    batch = dataset.get_eval_batch(rng, config.data.eval_batch_size)
+    logits = eval_forward(state.apply_fn, state.params, batch["inputs"])
+    metrics = dataset.compute_metrics(logits, batch["targets"], batch["mask"])
+    return metrics
+
+
+def train_loop(state: TrainState, dataset, config: Config) -> TrainState:
+    """Main training loop with logging and evaluation."""
+    import wandb
+
+    loss_fn = dataset.loss_fn
+    nan_check_interval = max(1, config.train.total_steps // 100)
+
+    for step in range(config.train.total_steps):
+        rng, batch_rng = jax.random.split(state.rng)
+        state = state.replace(rng=rng)
+        batch = dataset.get_batch(batch_rng, config.data.batch_size)
+
+        state, train_metrics = train_step(state, batch, loss_fn)
+
+        # NaN check
+        if (step + 1) % nan_check_interval == 0 and jnp.isnan(train_metrics["loss"]):
+            print(f"NaN loss at step {step + 1}, stopping.")
+            break
+
+        # Logging
+        if (step + 1) % config.train.log_interval == 0:
+            wandb.log({"train/loss": float(train_metrics["loss"])}, step=step + 1)
+
+        # Evaluation
+        if step == 0 or (step + 1) % config.eval.eval_interval == 0:
+            eval_metrics = eval_model(state, dataset, config)
+
+            # Rollout evaluation
+            if config.eval.do_rollout:
+                from src.model.inference import generate
+                rollout_metrics = dataset.evaluate_rollouts(
+                    state, generate, config,
+                )
+                eval_metrics.update(rollout_metrics)
+
+            wandb.log(eval_metrics, step=step + 1)
+
+            print(f"Step {step + 1}/{config.train.total_steps}")
+            for k, v in eval_metrics.items():
+                if isinstance(v, (int, float)):
+                    print(f"  {k}: {v:.4f}")
+
+    return state

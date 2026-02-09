@@ -1,0 +1,29 @@
+program: src.main
+method: grid
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  model.model_dim:
+    values: [64, 128, 256]
+  model.num_layers:
+    values: [2, 4]
+  train.learning_rate:
+    values: [0.0003, 0.001]
+  data.task_type:
+    value: bigram
+  data.vocab_size:
+    value: 64
+  data.sequence_length:
+    value: 64
+  train.total_steps:
+    value: 5000
+  eval.eval_interval:
+    value: 500
+  wandb_mode:
+    value: online

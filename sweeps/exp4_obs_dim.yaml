@@ -1,0 +1,35 @@
+program: src.main
+name: "Exp4: Obs Dim"
+method: grid
+metric:
+  name: eval/score_t+64
+  goal: minimize
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  data.task_type:
+    value: lds
+  data.dim_y:
+    values: [1, 2, 4]
+  model.patch_size:
+    values: [1, 8, 32]
+  data.lambda_val:
+    value: 0.9
+  data.structure:
+    value: dense
+  seed:
+    values: [0, 1]
+  train.learning_rate:
+    values: [0.001, 0.0003, 0.0001]
+  train.total_steps:
+    value: 10000
+  eval.do_rollout:
+    value: true
+  wandb_mode:
+    value: online

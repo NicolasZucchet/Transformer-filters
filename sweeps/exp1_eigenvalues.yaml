@@ -1,0 +1,35 @@
+program: src.main
+name: "Exp1: Eigenvalues"
+method: grid
+metric:
+  name: eval/score_t+64
+  goal: minimize
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  data.task_type:
+    value: lds
+  data.lambda_val:
+    values: [0.36, 0.68, 0.84, 0.92, 0.96, 0.98, 0.99]
+  data.structure:
+    value: dense
+  model.patch_size:
+    value: 1
+  data.dim_y:
+    value: 2
+  seed:
+    values: [0, 1]
+  train.learning_rate:
+    values: [0.001, 0.0003, 0.0001]
+  train.total_steps:
+    value: 10000
+  eval.do_rollout:
+    value: true
+  wandb_mode:
+    value: online
