@@ -61,22 +61,34 @@ def generate_system_parameters(key, dim_x, dim_y, lambda_val, structure='dense')
 
 
 @partial(jax.jit, static_argnums=(1, 2))
-def generate_sequences(key, batch_size, T, A, C, noise_std):
-    """Generate LDS sequences using jax.lax.scan."""
+def generate_sequences(key, batch_size, T, A, C, noise_std,
+                       obs_noise_std=0.0, b=None, x0_std=0.0):
+    """Generate LDS sequences using jax.lax.scan.
+
+    Args:
+        noise_std: process noise std (sigma)
+        obs_noise_std: observation noise std (added to y)
+        b: optional affine bias (dx,)
+        x0_std: initial state std (x0 ~ N(0, x0_std^2 I))
+    """
     dim_x = A.shape[0]
     dtype = A.dtype
+    bias = b if b is not None else jnp.zeros(dim_x, dtype=dtype)
 
     def step(x_t, k):
-        eps = jax.random.normal(k, x_t.shape) * noise_std
-        x_next = A @ x_t + eps
-        y_next = C @ x_next
+        k1, k2 = jax.random.split(k)
+        eps = jax.random.normal(k1, x_t.shape) * noise_std
+        x_next = A @ x_t + bias + eps
+        obs_noise = jax.random.normal(k2, (C.shape[0],)) * obs_noise_std
+        y_next = C @ x_next + obs_noise
         return x_next, (x_next, y_next)
 
     keys = jax.random.split(key, batch_size)
 
     def simulate_one(k):
-        ks = jax.random.split(k, T)
-        x0 = jnp.zeros(dim_x, dtype=dtype)
+        k1, k2 = jax.random.split(k)
+        ks = jax.random.split(k1, T)
+        x0 = jax.random.normal(k2, (dim_x,), dtype=dtype) * x0_std
         _, (xs, ys) = jax.lax.scan(step, x0, ks)
         return xs, ys
 
@@ -96,6 +108,9 @@ class LDSDataset(BaseDataset):
         structure: str = "dense",
         sigma: float = 1.0,
         sequence_length: int = 256,
+        obs_noise_std: float = 0.0,
+        x0_std: float = 0.0,
+        eval_sequence_length: int = 0,
         rng: jax.Array,
     ):
         super().__init__(name="lds")
@@ -103,34 +118,61 @@ class LDSDataset(BaseDataset):
         self.dim_y = dim_y
         self.sigma = sigma
         self.sequence_length = sequence_length
+        self.obs_noise_std = obs_noise_std
+        self.x0_std = x0_std
+        self.eval_sequence_length = eval_sequence_length if eval_sequence_length > 0 else sequence_length
+        self.b = None  # affine bias, set by subclasses
 
         # Generate system
         key, sys_key = jax.random.split(rng)
-        A, C = generate_system_parameters(sys_key, dim_x, dim_y, lambda_val, structure)
+        self._setup_system(sys_key, dim_x, dim_y, lambda_val, structure)
+
+        # Compute KF baseline MSE
+        self._compute_kf_baseline(key)
+
+    def _setup_system(self, key, dim_x, dim_y, lambda_val, structure):
+        """Set self.A, self.C (and optionally self.b). Override in subclasses."""
+        A, C = generate_system_parameters(key, dim_x, dim_y, lambda_val, structure)
         self.A = A
         self.C = C
 
-        # Cache vmap'd KF functions
-        self._kf_filter_vmap = jax.jit(jax.vmap(kalman_filter, in_axes=(0, None, None, None)))
-        self._kf_final_state_vmap = jax.jit(jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None)))
+    def _compute_kf_baseline(self, key):
+        """Compute KF baseline MSE and loss_scale."""
+        # Build P0 for KF
+        P0 = None
+        if self.x0_std > 0:
+            P0 = (self.x0_std ** 2) * jnp.eye(self.dim_x)
 
-        # Compute KF baseline MSE
-        key, val_key = jax.random.split(key)
+        # Cache vmap'd KF functions
+        self._kf_filter_vmap = jax.jit(jax.vmap(
+            kalman_filter, in_axes=(0, None, None, None, None, None, None)))
+        self._kf_final_state_vmap = jax.jit(jax.vmap(
+            kalman_filter_final_state, in_axes=(0, None, None, None, None, None, None)))
+
         val_T = 1024
         val_bs = 128
-        _, val_ys = generate_sequences(val_key, val_bs, val_T, A, C, sigma)
+        _, val_ys = generate_sequences(
+            key, val_bs, val_T, self.A, self.C, self.sigma,
+            obs_noise_std=self.obs_noise_std, b=self.b, x0_std=self.x0_std)
 
-        kf_preds, _ = self._kf_filter_vmap(val_ys, A, C, sigma)
+        R_std = self.obs_noise_std if self.obs_noise_std > 0 else 1e-4
+        kf_preds, _ = self._kf_filter_vmap(
+            val_ys, self.A, self.C, self.sigma, R_std, self.b, P0)
         kf_err = val_ys - kf_preds
         self.kf_mse = float(jnp.mean(jnp.square(kf_err)[:, 64:]))
         self.loss_scale = 1.0 / self.kf_mse
 
         print(f"Baseline KF MSE: {self.kf_mse:.6f}")
 
+    def _generate(self, rng, batch_size, T):
+        """Generate sequences with current system parameters."""
+        return generate_sequences(
+            rng, batch_size, T, self.A, self.C, self.sigma,
+            obs_noise_std=self.obs_noise_std, b=self.b, x0_std=self.x0_std)
+
     def get_batch(self, rng: jax.Array, batch_size: int) -> dict:
         """Return batch. inputs/targets are observation sequences."""
-        _, ys = generate_sequences(rng, batch_size, self.sequence_length, self.A, self.C, self.sigma)
-        # inputs and targets are both ys (next-step prediction via loss alignment)
+        _, ys = self._generate(rng, batch_size, self.sequence_length)
         mask = jnp.ones(ys.shape[:2], dtype=jnp.float32)
         return {
             "inputs": ys,
@@ -140,7 +182,15 @@ class LDSDataset(BaseDataset):
         }
 
     def get_eval_batch(self, rng: jax.Array, batch_size: int) -> dict:
-        return self.get_batch(rng, batch_size)
+        """Return eval batch (may use different sequence length)."""
+        _, ys = self._generate(rng, batch_size, self.eval_sequence_length)
+        mask = jnp.ones(ys.shape[:2], dtype=jnp.float32)
+        return {
+            "inputs": ys,
+            "targets": ys,
+            "mask": mask,
+            "loss_scale": self.loss_scale,
+        }
 
     @staticmethod
     def loss_fn(logits: jax.Array, targets: jax.Array, mask: jax.Array) -> jax.Array:
@@ -153,7 +203,6 @@ class LDSDataset(BaseDataset):
         for next-step prediction MSE.
         """
         B, T, dim_y = targets.shape
-        # logits may have different seq dim due to patching + zero prepend
         _, n_plus_1, pd = logits.shape
         patch_size = pd // dim_y
 
@@ -186,19 +235,25 @@ class LDSDataset(BaseDataset):
 
         A_T = self.A.T
         C_T = self.C.T
+        bias = self.b if self.b is not None else jnp.zeros(self.dim_x)
 
-        # Accumulate errors as arrays, one transfer at the end
-        all_model_mse = []  # list of (B, max_h) arrays
+        # Build P0 for KF
+        P0 = None
+        if self.x0_std > 0:
+            P0 = (self.x0_std ** 2) * jnp.eye(self.dim_x)
+        R_std = self.obs_noise_std if self.obs_noise_std > 0 else 1e-4
+
+        all_model_mse = []
         all_kf_mse = []
 
         key = jax.random.PRNGKey(42)
 
         for i in range(num_eval_batches):
             key, subkey = jax.random.split(key)
-            _, ys_eval = generate_sequences(subkey, eval_batch_size, seq_len, self.A, self.C, self.sigma)
+            _, ys_eval = self._generate(subkey, eval_batch_size, seq_len)
 
             warmup = ys_eval[:, :warmup_len]
-            truth = ys_eval[:, warmup_len:]  # (B, max_h, dim_y)
+            truth = ys_eval[:, warmup_len:]
 
             # Model rollout via generate()
             generated = generate_fn(
@@ -207,29 +262,28 @@ class LDSDataset(BaseDataset):
                 rng_key=subkey,
                 mode="continuous",
             )
-            model_preds = generated[:, warmup_len:, :self.dim_y]  # (B, max_h, dim_y)
+            model_preds = generated[:, warmup_len:, :self.dim_y]
 
-            # KF rollout via lax.scan
-            x_last = self._kf_final_state_vmap(warmup, self.A, self.C, self.sigma)
+            # KF rollout
+            x_last = self._kf_final_state_vmap(
+                warmup, self.A, self.C, self.sigma, R_std, self.b, P0)
 
             def kf_step(x, _):
-                x_next = x @ A_T
+                x_next = x @ A_T + bias
                 y_pred = x_next @ C_T
                 return x_next, y_pred
 
             _, kf_rollout = jax.lax.scan(kf_step, x_last, None, length=max_h)
-            kf_rollout = jnp.moveaxis(kf_rollout, 0, 1)  # (B, max_h, dim_y)
+            kf_rollout = jnp.moveaxis(kf_rollout, 0, 1)
 
-            # Vectorized per-horizon MSE: (B, max_h)
             model_mse = jnp.mean(jnp.square(model_preds - truth), axis=-1)
             kf_mse = jnp.mean(jnp.square(kf_rollout - truth), axis=-1)
             all_model_mse.append(model_mse)
             all_kf_mse.append(kf_mse)
 
-        # Single transfer to host
-        all_model_mse = jnp.concatenate(all_model_mse, axis=0)  # (N, max_h)
+        all_model_mse = jnp.concatenate(all_model_mse, axis=0)
         all_kf_mse = jnp.concatenate(all_kf_mse, axis=0)
-        mean_model = np.array(jnp.mean(all_model_mse, axis=0))  # (max_h,)
+        mean_model = np.array(jnp.mean(all_model_mse, axis=0))
         mean_kf = np.array(jnp.mean(all_kf_mse, axis=0))
 
         metrics = {}

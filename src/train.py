@@ -50,7 +50,7 @@ def create_train_state(
     # Create dummy input based on task type
     if config.data.task_type == "bigram":
         dummy_input = jnp.ones((1, config.data.sequence_length), dtype=jnp.int32)
-    elif config.data.task_type == "lds":
+    elif config.data.task_type in ("lds", "physics"):
         dummy_input = jnp.ones((1, config.data.sequence_length, config.data.dim_y), dtype=jnp.float32)
     else:
         raise ValueError(f"Unknown task_type: {config.data.task_type}")

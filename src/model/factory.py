@@ -71,7 +71,7 @@ def create_model(model_config: ModelConfig, data_config: DataConfig) -> Sequence
             dtype=dtype,
         )
         head = ClassificationHead(vocab_size=data_config.vocab_size, dtype=dtype)
-    elif data_config.task_type == "lds":
+    elif data_config.task_type in ("lds", "physics"):
         input_layer = PatchingInput(
             model_dim=model_config.model_dim,
             patch_size=model_config.patch_size,
