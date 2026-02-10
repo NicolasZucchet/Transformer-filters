@@ -226,7 +226,9 @@ class LDSDataset(BaseDataset):
 
     def evaluate_rollouts(self, state, generate_fn, config) -> dict:
         """Evaluate model and KF rollouts at multiple horizons."""
-        max_h = 64
+        import wandb
+
+        max_h = config.eval.rollout_steps
         warmup_len = config.eval.warmup_len
         n_eval = config.eval.n_eval
         eval_batch_size = 256
@@ -245,6 +247,10 @@ class LDSDataset(BaseDataset):
 
         all_model_mse = []
         all_kf_mse = []
+        # Store first batch for trajectory visualization
+        viz_truth = None
+        viz_model = None
+        viz_kf = None
 
         key = jax.random.PRNGKey(42)
 
@@ -281,6 +287,11 @@ class LDSDataset(BaseDataset):
             all_model_mse.append(model_mse)
             all_kf_mse.append(kf_mse)
 
+            if i == 0:
+                viz_truth = np.array(truth[:4])
+                viz_model = np.array(model_preds[:4])
+                viz_kf = np.array(kf_rollout[:4])
+
         all_model_mse = jnp.concatenate(all_model_mse, axis=0)
         all_kf_mse = jnp.concatenate(all_kf_mse, axis=0)
         mean_model = np.array(jnp.mean(all_model_mse, axis=0))
@@ -290,4 +301,32 @@ class LDSDataset(BaseDataset):
         for h in range(1, max_h + 1):
             metrics[f"eval/score_t+{h}"] = float(mean_model[h - 1] / mean_kf[h - 1])
 
+        # Log trajectory visualizations
+        self._log_rollout_trajectories(viz_truth, viz_model, viz_kf, max_h)
+
         return metrics
+
+    @staticmethod
+    def _log_rollout_trajectories(truth, model_preds, kf_preds, max_h):
+        """Log example rollout trajectories to wandb as line plots."""
+        import wandb
+
+        n_examples = truth.shape[0]
+        dim_y = truth.shape[2]
+        timesteps = list(range(1, max_h + 1))
+
+        plots = {}
+        for dim in range(min(dim_y, 2)):  # log first 2 output dims
+            for i in range(n_examples):
+                plots[f"eval/rollout_y{dim}_ex{i}"] = wandb.plot.line_series(
+                    xs=timesteps,
+                    ys=[
+                        [float(truth[i, t-1, dim]) for t in timesteps],
+                        [float(model_preds[i, t-1, dim]) for t in timesteps],
+                        [float(kf_preds[i, t-1, dim]) for t in timesteps],
+                    ],
+                    keys=["truth", "model", "kf"],
+                    title=f"Rollout dim={dim} example={i}",
+                    xname="horizon",
+                )
+        wandb.log(plots, commit=False)
