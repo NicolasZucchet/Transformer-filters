@@ -11,7 +11,7 @@ def create_dataset(config: DataConfig, rng: jax.Array) -> BaseDataset:
         return BigramDataset(
             vocab_size=config.vocab_size,
             sequence_length=config.sequence_length,
-            seed=config.seed,
+            rng=rng,
         )
     elif config.task_type == "lds":
         from src.data.lds import LDSDataset
@@ -22,7 +22,7 @@ def create_dataset(config: DataConfig, rng: jax.Array) -> BaseDataset:
             structure=config.structure,
             sigma=config.sigma,
             sequence_length=config.sequence_length,
-            seed=config.seed,
+            rng=rng,
         )
     else:
         raise ValueError(f"Unknown task_type: {config.task_type}")

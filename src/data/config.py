@@ -8,7 +8,6 @@ class DataConfig:
     batch_size: int = 128
     eval_batch_size: int = 1024
     sequence_length: int = 64
-    seed: int = 42
     # Bigram-specific
     vocab_size: int = 64
     # LDS-specific

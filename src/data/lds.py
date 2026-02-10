@@ -95,7 +95,7 @@ class LDSDataset(BaseDataset):
         structure: str = "dense",
         sigma: float = 1.0,
         sequence_length: int = 256,
-        seed: int = 42,
+        rng: jax.Array,
     ):
         super().__init__(name="lds")
         self.dim_x = dim_x
@@ -104,8 +104,7 @@ class LDSDataset(BaseDataset):
         self.sequence_length = sequence_length
 
         # Generate system
-        key = jax.random.PRNGKey(seed)
-        key, sys_key = jax.random.split(key)
+        key, sys_key = jax.random.split(rng)
         A, C = generate_system_parameters(sys_key, dim_x, dim_y, lambda_val, structure)
         self.A = A
         self.C = C
@@ -161,8 +160,7 @@ class LDSDataset(BaseDataset):
         preds_aligned = preds[:, 1:T]
         targets_aligned = targets[:, 1:]
 
-        sq_err = jnp.sum((preds_aligned - targets_aligned) ** 2, axis=-1)  # (B, T-1)
-        return jnp.mean(sq_err)
+        return jnp.mean((preds_aligned - targets_aligned) ** 2)
 
     def compute_metrics(
         self, logits: jax.Array, targets: jax.Array, mask: jax.Array

@@ -9,12 +9,13 @@ from src.data.metrics import compute_accuracy, compute_cross_entropy, compute_pe
 class BigramDataset(BaseDataset):
     """Random bigram transition matrix, next-token prediction task."""
 
-    def __init__(self, vocab_size: int, sequence_length: int, seed: int = 42):
+    def __init__(self, vocab_size: int, sequence_length: int, rng: jax.Array):
         super().__init__(name="bigram")
         self.vocab_size = vocab_size
         self.sequence_length = sequence_length
 
         # Generate random transition matrix via Dirichlet
+        seed = int(jax.random.bits(rng))
         rng = np.random.default_rng(seed)
         # Each row is a probability distribution over next tokens
         alpha = np.ones(vocab_size)
