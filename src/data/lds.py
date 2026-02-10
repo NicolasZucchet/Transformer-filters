@@ -89,6 +89,7 @@ class LDSDataset(BaseDataset):
 
     def __init__(
         self,
+        *,
         dim_x: int = 64,
         dim_y: int = 2,
         lambda_val: float = 0.9,
@@ -109,14 +110,17 @@ class LDSDataset(BaseDataset):
         self.A = A
         self.C = C
 
+        # Cache vmap'd KF functions
+        self._kf_filter_vmap = jax.jit(jax.vmap(kalman_filter, in_axes=(0, None, None, None)))
+        self._kf_final_state_vmap = jax.jit(jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None)))
+
         # Compute KF baseline MSE
         key, val_key = jax.random.split(key)
         val_T = 1024
         val_bs = 128
         _, val_ys = generate_sequences(val_key, val_bs, val_T, A, C, sigma)
 
-        kf_filter_vmap = jax.vmap(kalman_filter, in_axes=(0, None, None, None))
-        kf_preds, _ = kf_filter_vmap(val_ys, A, C, sigma)
+        kf_preds, _ = self._kf_filter_vmap(val_ys, A, C, sigma)
         kf_err = val_ys - kf_preds
         self.kf_mse = float(jnp.mean(jnp.square(kf_err)[:, 64:]))
         self.loss_scale = 1.0 / self.kf_mse
@@ -174,17 +178,18 @@ class LDSDataset(BaseDataset):
     def evaluate_rollouts(self, state, generate_fn, config) -> dict:
         """Evaluate model and KF rollouts at multiple horizons."""
         max_h = 64
-        eval_horizons = list(range(1, max_h + 1))
         warmup_len = config.eval.warmup_len
         n_eval = config.eval.n_eval
         eval_batch_size = 256
         num_eval_batches = max(1, n_eval // eval_batch_size)
         seq_len = warmup_len + max_h
 
-        get_final_state = jax.vmap(kalman_filter_final_state, in_axes=(0, None, None, None))
+        A_T = self.A.T
+        C_T = self.C.T
 
-        model_errors = {h: [] for h in eval_horizons}
-        kf_errors = {h: [] for h in eval_horizons}
+        # Accumulate errors as arrays, one transfer at the end
+        all_model_mse = []  # list of (B, max_h) arrays
+        all_kf_mse = []
 
         key = jax.random.PRNGKey(42)
 
@@ -193,7 +198,7 @@ class LDSDataset(BaseDataset):
             _, ys_eval = generate_sequences(subkey, eval_batch_size, seq_len, self.A, self.C, self.sigma)
 
             warmup = ys_eval[:, :warmup_len]
-            truth = ys_eval[:, warmup_len:]
+            truth = ys_eval[:, warmup_len:]  # (B, max_h, dim_y)
 
             # Model rollout via generate()
             generated = generate_fn(
@@ -201,33 +206,34 @@ class LDSDataset(BaseDataset):
                 max_new_tokens=max_h,
                 rng_key=subkey,
                 mode="continuous",
-            )  # (B, warmup_len + max_h, P*dim_y)
+            )
+            model_preds = generated[:, warmup_len:, :self.dim_y]  # (B, max_h, dim_y)
 
-            # Extract predictions after warmup
-            model_preds = generated[:, warmup_len:, :self.dim_y]
+            # KF rollout via lax.scan
+            x_last = self._kf_final_state_vmap(warmup, self.A, self.C, self.sigma)
 
-            # KF rollout
-            x_last = get_final_state(warmup, self.A, self.C, self.sigma)
-            kf_preds_list = []
-            x_curr = x_last
-            for _ in range(max_h):
-                x_curr = x_curr @ self.A.T
-                y_pred = x_curr @ self.C.T
-                kf_preds_list.append(y_pred[:, None, :])
-            kf_rollout = jnp.concatenate(kf_preds_list, axis=1)
+            def kf_step(x, _):
+                x_next = x @ A_T
+                y_pred = x_next @ C_T
+                return x_next, y_pred
 
-            for h in eval_horizons:
-                idx = h - 1
-                m_err = jnp.mean(jnp.square(model_preds[:, idx] - truth[:, idx]), axis=-1)
-                k_err = jnp.mean(jnp.square(kf_rollout[:, idx] - truth[:, idx]), axis=-1)
-                model_errors[h].extend(m_err.tolist())
-                kf_errors[h].extend(k_err.tolist())
+            _, kf_rollout = jax.lax.scan(kf_step, x_last, None, length=max_h)
+            kf_rollout = jnp.moveaxis(kf_rollout, 0, 1)  # (B, max_h, dim_y)
+
+            # Vectorized per-horizon MSE: (B, max_h)
+            model_mse = jnp.mean(jnp.square(model_preds - truth), axis=-1)
+            kf_mse = jnp.mean(jnp.square(kf_rollout - truth), axis=-1)
+            all_model_mse.append(model_mse)
+            all_kf_mse.append(kf_mse)
+
+        # Single transfer to host
+        all_model_mse = jnp.concatenate(all_model_mse, axis=0)  # (N, max_h)
+        all_kf_mse = jnp.concatenate(all_kf_mse, axis=0)
+        mean_model = np.array(jnp.mean(all_model_mse, axis=0))  # (max_h,)
+        mean_kf = np.array(jnp.mean(all_kf_mse, axis=0))
 
         metrics = {}
-        for h in eval_horizons:
-            mean_model = np.mean(model_errors[h])
-            mean_kf = np.mean(kf_errors[h])
-            ratio = mean_model / mean_kf
-            metrics[f"eval/score_t+{h}"] = ratio
+        for h in range(1, max_h + 1):
+            metrics[f"eval/score_t+{h}"] = float(mean_model[h - 1] / mean_kf[h - 1])
 
         return metrics

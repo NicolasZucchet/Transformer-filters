@@ -40,28 +40,6 @@ def _decode_step_discrete(params, x, cache, rng, step_idx, apply_fn, temperature
     return next_token, new_cache, new_rng
 
 
-@partial(jax.jit, static_argnums=(3, 4))
-def _prefill_step_continuous(params, x, rng, max_len, apply_fn):
-    """Prefill for continuous vector generation."""
-    logits, cache = apply_fn(
-        {"params": params}, x,
-        deterministic=True, init_cache=True, max_seq_len=max_len,
-    )
-    next_state = logits[:, -1:, :]  # (B, 1, D)
-    return next_state, cache
-
-
-@partial(jax.jit, static_argnums=(4,))
-def _decode_step_continuous(params, x, cache, step_idx, apply_fn):
-    """Decode one step for continuous generation."""
-    logits, new_cache = apply_fn(
-        {"params": params}, x,
-        deterministic=True, cache=cache, decode_step=step_idx,
-    )
-    next_state = logits[:, -1:, :]  # (B, 1, D)
-    return next_state, new_cache
-
-
 def generate(
     state, prompt, max_new_tokens, temperature=1.0, rng_key=None, mode="discrete",
 ):
@@ -88,7 +66,7 @@ def generate(
     if mode == "discrete":
         return _generate_discrete(state, prompt, max_new_tokens, temperature, rng_key)
     elif mode == "continuous":
-        return _generate_continuous(state, prompt, max_new_tokens, rng_key)
+        return _generate_continuous(state.params, prompt, max_new_tokens, state.apply_fn)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -113,21 +91,38 @@ def _generate_discrete(state, prompt, max_new_tokens, temperature, rng_key):
     return curr_seq
 
 
-def _generate_continuous(state, prompt, max_new_tokens, rng_key):
-    """Continuous vector generation with KV cache."""
+@partial(jax.jit, static_argnums=(2, 3))
+def _generate_continuous(params, prompt, max_new_tokens, apply_fn):
+    """Continuous vector generation with KV cache, fused via lax.scan."""
     B, L, D = prompt.shape
     total_len = L + max_new_tokens
 
-    next_state, cache = _prefill_step_continuous(
-        state.params, prompt, rng_key, total_len, state.apply_fn,
+    # Prefill
+    logits, cache = apply_fn(
+        {"params": params}, prompt,
+        deterministic=True, init_cache=True, max_seq_len=total_len,
     )
-    curr_seq = jnp.concatenate([prompt, next_state], axis=1)
+    first_pred = logits[:, -1:, :]  # (B, 1, D)
 
-    for i in range(max_new_tokens - 1):
-        x = next_state
-        next_state, cache = _decode_step_continuous(
-            state.params, x, cache, L + i, state.apply_fn,
+    if max_new_tokens == 1:
+        return jnp.concatenate([prompt, first_pred], axis=1)
+
+    # Decode via lax.scan (fused into single XLA computation)
+    def decode_step(carry, _):
+        x, cache, step_idx = carry
+        logits, new_cache = apply_fn(
+            {"params": params}, x,
+            deterministic=True, cache=cache, decode_step=step_idx,
         )
-        curr_seq = jnp.concatenate([curr_seq, next_state], axis=1)
+        next_state = logits[:, -1:, :]
+        return (next_state, new_cache, step_idx + 1), next_state[:, 0, :]
 
-    return curr_seq
+    init_carry = (first_pred, cache, L)
+    _, generated = jax.lax.scan(
+        decode_step, init_carry, None, length=max_new_tokens - 1,
+    )
+    # generated: (max_new_tokens - 1, B, D)
+    generated = jnp.moveaxis(generated, 0, 1)  # (B, max_new_tokens - 1, D)
+
+    all_preds = jnp.concatenate([first_pred, generated], axis=1)
+    return jnp.concatenate([prompt, all_preds], axis=1)

@@ -20,7 +20,7 @@ class TrainConfig:
 
 @dataclass
 class EvalConfig:
-    eval_interval: int = 500
+    eval_interval: int = 2500
     do_rollout: bool = False
     num_rollouts: int = 256
     rollout_steps: int = 64
