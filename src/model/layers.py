@@ -11,7 +11,7 @@ class EmbeddingInput(nn.Module):
     dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, decode=False):
         return nn.Embed(
             num_embeddings=self.vocab_size,
             features=self.model_dim,
@@ -25,22 +25,27 @@ class LinearInput(nn.Module):
     dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, decode=False):
         return nn.Dense(self.model_dim, dtype=self.dtype)(x)
 
 
 class PatchingInput(nn.Module):
-    """Linear projection with patching and causal zero-prepend for time series."""
+    """Linear projection with patching and causal zero-prepend for time series.
+
+    During prefill/training: patches observations, prepends zero for causality, projects.
+    During decode: input is already patch-sized (P*dim_y), just projects.
+    """
     model_dim: int
     patch_size: int = 1
     dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, x):
-        b, t, d = x.shape
-        p = self.patch_size
-        if p > 1:
-            x = x.reshape(b, t // p, p * d)
-        zero = jnp.zeros((b, 1, x.shape[-1]), dtype=x.dtype)
-        x = jnp.concatenate([zero, x], axis=1)
+    def __call__(self, x, decode=False):
+        if not decode:
+            b, t, d = x.shape
+            p = self.patch_size
+            if p > 1:
+                x = x.reshape(b, t // p, p * d)
+            zero = jnp.zeros((b, 1, x.shape[-1]), dtype=x.dtype)
+            x = jnp.concatenate([zero, x], axis=1)
         return nn.Dense(self.model_dim, dtype=self.dtype)(x)

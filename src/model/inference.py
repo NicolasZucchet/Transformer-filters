@@ -93,19 +93,30 @@ def _generate_discrete(state, prompt, max_new_tokens, temperature, rng_key):
 
 @partial(jax.jit, static_argnums=(2, 3))
 def _generate_continuous(params, prompt, max_new_tokens, apply_fn):
-    """Continuous vector generation with KV cache, fused via lax.scan."""
+    """Continuous vector generation with KV cache, fused via lax.scan.
+
+    Handles patching: the model may output P*dim_y per step (one patch).
+    Predictions are unpacked to individual observations in the output.
+    """
     B, L, D = prompt.shape
     total_len = L + max_new_tokens
 
-    # Prefill
+    # Prefill — PatchingInput patches + zero-prepends internally
     logits, cache = apply_fn(
         {"params": params}, prompt,
         deterministic=True, init_cache=True, max_seq_len=total_len,
     )
-    first_pred = logits[:, -1:, :]  # (B, 1, D)
+    internal_len = logits.shape[1]  # L/P + 1 (patching + zero-prepend)
+    output_dim = logits.shape[2]    # P * dim_y
+    patch_size = output_dim // D
+    first_pred = logits[:, -1:, :]  # (B, 1, P*dim_y)
 
-    if max_new_tokens == 1:
-        return jnp.concatenate([prompt, first_pred], axis=1)
+    # Number of patch-level decode steps needed
+    n_patches = -(-max_new_tokens // patch_size)  # ceil division
+
+    if n_patches <= 1:
+        preds = first_pred.reshape(B, patch_size, D)[:, :max_new_tokens, :]
+        return jnp.concatenate([prompt, preds], axis=1)
 
     # Decode via lax.scan (fused into single XLA computation)
     def decode_step(carry, _):
@@ -114,15 +125,19 @@ def _generate_continuous(params, prompt, max_new_tokens, apply_fn):
             {"params": params}, x,
             deterministic=True, cache=cache, decode_step=step_idx,
         )
-        next_state = logits[:, -1:, :]
-        return (next_state, new_cache, step_idx + 1), next_state[:, 0, :]
+        next_pred = logits[:, -1:, :]
+        return (next_pred, new_cache, step_idx + 1), next_pred[:, 0, :]
 
-    init_carry = (first_pred, cache, L)
+    init_carry = (first_pred, cache, internal_len)
     _, generated = jax.lax.scan(
-        decode_step, init_carry, None, length=max_new_tokens - 1,
+        decode_step, init_carry, None, length=n_patches - 1,
     )
-    # generated: (max_new_tokens - 1, B, D)
-    generated = jnp.moveaxis(generated, 0, 1)  # (B, max_new_tokens - 1, D)
+    # generated: (n_patches - 1, B, P*dim_y)
+    generated = jnp.moveaxis(generated, 0, 1)  # (B, n_patches - 1, P*dim_y)
 
-    all_preds = jnp.concatenate([first_pred, generated], axis=1)
+    all_patch_preds = jnp.concatenate([first_pred, generated], axis=1)
+    # Unpack patches to individual observations
+    all_preds = all_patch_preds.reshape(B, n_patches * patch_size, D)
+    all_preds = all_preds[:, :max_new_tokens, :]  # trim to exact count
+
     return jnp.concatenate([prompt, all_preds], axis=1)

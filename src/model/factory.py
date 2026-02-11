@@ -22,7 +22,7 @@ class SequenceModel(nn.Module):
         self, x, mask=None, deterministic=True,
         init_cache=False, cache=None, decode_step=None, max_seq_len=None,
     ):
-        x = self.input_layer(x)
+        x = self.input_layer(x, decode=(decode_step is not None))
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         backbone_out = self.backbone(
