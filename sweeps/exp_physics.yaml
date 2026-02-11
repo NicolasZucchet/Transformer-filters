@@ -16,13 +16,15 @@ parameters:
   data.task_type:
     value: physics
   data.physics_system:
-    values: [harmonic, damped, coupled, projectile]
+    values: [damped] # harmonic, damped, coupled, projectile]
   data.obs_noise_std:
     value: 0.1
   data.x0_std:
     value: 1.0
+  data.dt:
+    value: 0.6
   data.sequence_length:
-    value: 64
+    value: 256
   data.eval_sequence_length:
     values: [64, 256]
   seed:
