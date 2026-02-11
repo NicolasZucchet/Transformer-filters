@@ -108,13 +108,12 @@ class CausalSelfAttention(nn.Module):
         scale = head_dim ** -0.5
         sim = jnp.matmul(q, jnp.swapaxes(k, -1, -2)) * scale
 
-        if mask is not None:
-            sim = jnp.where(mask, sim, -1e9)
-        elif cache is not None and decode_step is not None:
-            max_len = k.shape[2]
-            idxs = jnp.arange(max_len)
-            mask_cache = idxs <= decode_step
-            sim = jnp.where(mask_cache[None, None, None, :], sim, -1e9)
+        # Causal mask
+        start_pos = decode_step if decode_step is not None else 0
+        q_pos = jnp.arange(L) + start_pos
+        k_pos = jnp.arange(sim.shape[-1])
+        causal_mask = k_pos[None, :] <= q_pos[:, None]
+        sim = jnp.where(causal_mask[None, None, :, :], sim, -1e9)
 
         attn = nn.softmax(sim, axis=-1).astype(self.dtype)
         if not deterministic and self.dropout_rate > 0.0:
