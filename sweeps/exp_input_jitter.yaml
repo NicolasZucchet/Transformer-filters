@@ -1,6 +1,14 @@
 program: src.main
 name: "Input Jitter Ablation"
 method: grid
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - ${program}
+  - ${args}
 metric:
   name: eval/score_t+64
   goal: minimize
