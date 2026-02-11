@@ -23,20 +23,16 @@ def discretize_affine(A_c, b_c, dt):
     return A_d, b_d
 
 
-def build_observation_matrix(dim_x, observe_positions=True, observe_velocities=False):
-    """Build C matrix selecting position/velocity components.
+def build_observation_matrix(dim_x, observation="position"):
+    """Build C matrix for position-only or full (position + velocity) observation.
 
     State layout: [q1..qn, v1..vn] where n = dim_x // 2.
     """
+    if observation == "full":
+        return np.eye(dim_x)
+    # Default: position only
     n = dim_x // 2
-    rows = []
-    if observe_positions:
-        rows.append(np.eye(n, dim_x))  # selects q1..qn
-    if observe_velocities:
-        rows.append(np.hstack([np.zeros((n, n)), np.eye(n, dim_x - n)]))
-    if not rows:
-        raise ValueError("Must observe at least positions or velocities")
-    return np.vstack(rows)
+    return np.eye(n, dim_x)  # selects q1..qn
 
 
 class PhysicsLDSDataset(LDSDataset):
@@ -51,11 +47,7 @@ class PhysicsLDSDataset(LDSDataset):
         A_d, b_d = discretize_affine(A_c, b_c_arr, config.dt)
 
         # Build observation matrix
-        C = build_observation_matrix(
-            dim_x,
-            observe_positions=config.observe_positions,
-            observe_velocities=config.observe_velocities,
-        )
+        C = build_observation_matrix(dim_x, config.observation)
         dim_y = C.shape[0]
 
         # Store as JAX arrays
@@ -74,6 +66,7 @@ class PhysicsLDSDataset(LDSDataset):
             obs_noise_std=config.obs_noise_std,
             x0_std=config.x0_std,
             eval_sequence_length=config.eval_sequence_length,
+            skip_kf=config.skip_kf,
             rng=rng,
         )
         self.name = "physics"

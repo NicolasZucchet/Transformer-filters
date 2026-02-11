@@ -27,5 +27,5 @@ class DataConfig:
     n_oscillators: int = 3
     coupling_strength: float = 0.5
     gravity: float = 9.81
-    observe_positions: bool = True
-    observe_velocities: bool = False
+    observation: str = "position"  # "position" or "full" (position + velocity)
+    skip_kf: bool = False  # skip Kalman filter baseline

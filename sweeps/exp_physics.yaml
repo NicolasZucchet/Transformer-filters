@@ -21,6 +21,8 @@ parameters:
     value: 0.1
   data.x0_std:
     value: 1.0
+  data.skip_kf:
+    value: true
   data.dt:
     value: 0.6
   data.sequence_length:

@@ -111,6 +111,7 @@ class LDSDataset(BaseDataset):
         obs_noise_std: float = 0.0,
         x0_std: float = 0.0,
         eval_sequence_length: int = 0,
+        skip_kf: bool = False,
         rng: jax.Array,
     ):
         super().__init__(name="lds")
@@ -121,6 +122,7 @@ class LDSDataset(BaseDataset):
         self.obs_noise_std = obs_noise_std
         self.x0_std = x0_std
         self.eval_sequence_length = eval_sequence_length if eval_sequence_length > 0 else sequence_length
+        self.skip_kf = skip_kf
         self.b = None  # affine bias, set by subclasses
 
         # Generate system
@@ -128,7 +130,11 @@ class LDSDataset(BaseDataset):
         self._setup_system(sys_key, dim_x, dim_y, lambda_val, structure)
 
         # Compute KF baseline MSE
-        self._compute_kf_baseline(key)
+        if skip_kf:
+            self.kf_mse = 1.0
+            self.loss_scale = 1.0
+        else:
+            self._compute_kf_baseline(key)
 
     def _setup_system(self, key, dim_x, dim_y, lambda_val, structure):
         """Set self.A, self.C (and optionally self.b). Override in subclasses."""
@@ -239,11 +245,12 @@ class LDSDataset(BaseDataset):
         C_T = self.C.T
         bias = self.b if self.b is not None else jnp.zeros(self.dim_x)
 
-        # Build P0 for KF
-        P0 = None
-        if self.x0_std > 0:
-            P0 = (self.x0_std ** 2) * jnp.eye(self.dim_x)
-        R_std = self.obs_noise_std if self.obs_noise_std > 0 else 1e-4
+        # Build P0 for KF (only if needed)
+        if not self.skip_kf:
+            P0 = None
+            if self.x0_std > 0:
+                P0 = (self.x0_std ** 2) * jnp.eye(self.dim_x)
+            R_std = self.obs_noise_std if self.obs_noise_std > 0 else 1e-4
 
         all_model_mse = []
         all_kf_mse = []
@@ -270,36 +277,43 @@ class LDSDataset(BaseDataset):
             )
             model_preds = generated[:, warmup_len:, :self.dim_y]
 
-            # KF rollout
-            x_last = self._kf_final_state_vmap(
-                warmup, self.A, self.C, self.sigma, R_std, self.b, P0)
-
-            def kf_step(x, _):
-                x_next = x @ A_T + bias
-                y_pred = x_next @ C_T
-                return x_next, y_pred
-
-            _, kf_rollout = jax.lax.scan(kf_step, x_last, None, length=max_h)
-            kf_rollout = jnp.moveaxis(kf_rollout, 0, 1)
-
             model_mse = jnp.mean(jnp.square(model_preds - truth), axis=-1)
-            kf_mse = jnp.mean(jnp.square(kf_rollout - truth), axis=-1)
             all_model_mse.append(model_mse)
-            all_kf_mse.append(kf_mse)
+
+            if not self.skip_kf:
+                # KF rollout
+                x_last = self._kf_final_state_vmap(
+                    warmup, self.A, self.C, self.sigma, R_std, self.b, P0)
+
+                def kf_step(x, _):
+                    x_next = x @ A_T + bias
+                    y_pred = x_next @ C_T
+                    return x_next, y_pred
+
+                _, kf_rollout = jax.lax.scan(kf_step, x_last, None, length=max_h)
+                kf_rollout = jnp.moveaxis(kf_rollout, 0, 1)
+
+                kf_mse = jnp.mean(jnp.square(kf_rollout - truth), axis=-1)
+                all_kf_mse.append(kf_mse)
 
             if i == 0:
                 viz_truth = np.array(truth[:4])
                 viz_model = np.array(model_preds[:4])
-                viz_kf = np.array(kf_rollout[:4])
+                if not self.skip_kf:
+                    viz_kf = np.array(kf_rollout[:4])
 
         all_model_mse = jnp.concatenate(all_model_mse, axis=0)
-        all_kf_mse = jnp.concatenate(all_kf_mse, axis=0)
         mean_model = np.array(jnp.mean(all_model_mse, axis=0))
-        mean_kf = np.array(jnp.mean(all_kf_mse, axis=0))
 
         metrics = {}
-        for h in range(1, max_h + 1):
-            metrics[f"eval/score_t+{h}"] = float(mean_model[h - 1] / mean_kf[h - 1])
+        if self.skip_kf:
+            for h in range(1, max_h + 1):
+                metrics[f"eval/score_t+{h}"] = float(mean_model[h - 1])
+        else:
+            all_kf_mse = jnp.concatenate(all_kf_mse, axis=0)
+            mean_kf = np.array(jnp.mean(all_kf_mse, axis=0))
+            for h in range(1, max_h + 1):
+                metrics[f"eval/score_t+{h}"] = float(mean_model[h - 1] / mean_kf[h - 1])
 
         # Log trajectory visualizations
         self._log_rollout_trajectories(viz_truth, viz_model, viz_kf, max_h)
@@ -318,14 +332,18 @@ class LDSDataset(BaseDataset):
         plots = {}
         for dim in range(min(dim_y, 2)):  # log first 2 output dims
             for i in range(n_examples):
+                ys = [
+                    [float(truth[i, t-1, dim]) for t in timesteps],
+                    [float(model_preds[i, t-1, dim]) for t in timesteps],
+                ]
+                keys = ["truth", "model"]
+                if kf_preds is not None:
+                    ys.append([float(kf_preds[i, t-1, dim]) for t in timesteps])
+                    keys.append("kf")
                 plots[f"eval/rollout_y{dim}_ex{i}"] = wandb.plot.line_series(
                     xs=timesteps,
-                    ys=[
-                        [float(truth[i, t-1, dim]) for t in timesteps],
-                        [float(model_preds[i, t-1, dim]) for t in timesteps],
-                        [float(kf_preds[i, t-1, dim]) for t in timesteps],
-                    ],
-                    keys=["truth", "model", "kf"],
+                    ys=ys,
+                    keys=keys,
                     title=f"Rollout dim={dim} example={i}",
                     xname="horizon",
                 )
