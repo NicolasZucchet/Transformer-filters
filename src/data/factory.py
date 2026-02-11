@@ -22,6 +22,7 @@ def create_dataset(config: DataConfig, rng: jax.Array) -> BaseDataset:
             structure=config.structure,
             sigma=config.sigma,
             sequence_length=config.sequence_length,
+            input_noise_std=config.input_noise_std,
             rng=rng,
         )
     elif config.task_type == "physics":

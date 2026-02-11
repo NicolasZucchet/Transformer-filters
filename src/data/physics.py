@@ -67,6 +67,7 @@ class PhysicsLDSDataset(LDSDataset):
             x0_std=config.x0_std,
             eval_sequence_length=config.eval_sequence_length,
             skip_kf=config.skip_kf,
+            input_noise_std=config.input_noise_std,
             rng=rng,
         )
         self.name = "physics"

@@ -1,0 +1,47 @@
+program: src.main
+name: "Input Jitter Ablation"
+method: grid
+metric:
+  name: eval/score_t+64
+  goal: minimize
+parameters:
+  data.task_type:
+    value: physics
+  data.physics_system:
+    values: [damped, harmonic]
+  data.obs_noise_std:
+    values: [0, 0.1]
+  data.input_noise_std:
+    values: [0, 0.01, 0.1]
+  data.x0_std:
+    value: 1.0
+  data.skip_kf:
+    value: true
+  data.dt:
+    value: 0.5
+  data.sequence_length:
+    value: 256
+  data.eval_sequence_length:
+    value: 256
+  model.num_layers:
+    value: 2
+  model.num_heads:
+    value: 4
+  model.model_dim:
+    value: 128
+  seed:
+    values: [0, 1, 2]
+  train.learning_rate:
+    values: [0.001, 0.0003]
+  train.total_steps:
+    value: 10000
+  eval.do_rollout:
+    value: true
+  eval.rollout_steps:
+    value: 256
+  eval.warmup_len:
+    value: 64
+  eval.n_eval:
+    value: 1024
+  wandb_mode:
+    value: online

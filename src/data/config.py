@@ -29,3 +29,4 @@ class DataConfig:
     gravity: float = 9.81
     observation: str = "position"  # "position" or "full" (position + velocity)
     skip_kf: bool = False  # skip Kalman filter baseline
+    input_noise_std: float = 0.0  # training-time input jitter (noise added to inputs only)

@@ -112,6 +112,7 @@ class LDSDataset(BaseDataset):
         x0_std: float = 0.0,
         eval_sequence_length: int = 0,
         skip_kf: bool = False,
+        input_noise_std: float = 0.0,
         rng: jax.Array,
     ):
         super().__init__(name="lds")
@@ -121,6 +122,7 @@ class LDSDataset(BaseDataset):
         self.sequence_length = sequence_length
         self.obs_noise_std = obs_noise_std
         self.x0_std = x0_std
+        self.input_noise_std = input_noise_std
         self.eval_sequence_length = eval_sequence_length if eval_sequence_length > 0 else sequence_length
         self.skip_kf = skip_kf
         self.b = None  # affine bias, set by subclasses
@@ -178,10 +180,17 @@ class LDSDataset(BaseDataset):
 
     def get_batch(self, rng: jax.Array, batch_size: int) -> dict:
         """Return batch. inputs/targets are observation sequences."""
-        _, ys = self._generate(rng, batch_size, self.sequence_length)
+        if self.input_noise_std > 0:
+            gen_rng, noise_rng = jax.random.split(rng)
+        else:
+            gen_rng = rng
+        _, ys = self._generate(gen_rng, batch_size, self.sequence_length)
+        inputs = ys
+        if self.input_noise_std > 0:
+            inputs = ys + jax.random.normal(noise_rng, ys.shape) * self.input_noise_std
         mask = jnp.ones(ys.shape[:2], dtype=jnp.float32)
         return {
-            "inputs": ys,
+            "inputs": inputs,
             "targets": ys,
             "mask": mask,
             "loss_scale": self.loss_scale,
