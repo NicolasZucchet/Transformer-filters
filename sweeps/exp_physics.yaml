@@ -18,21 +18,29 @@ parameters:
   data.physics_system:
     values: [damped] # harmonic, damped, coupled, projectile]
   data.obs_noise_std:
-    value: 0.1
+    values: [0, 0.1]
   data.x0_std:
     value: 1.0
   data.skip_kf:
     value: true
   data.dt:
-    value: 0.6
+    value: 0.5
   data.sequence_length:
     value: 256
   data.eval_sequence_length:
-    values: [64, 256]
+    value: 256
+  model.num_layers:
+    value: 2
+  model.num_heads:
+    value: 4
+  model.model_dim:
+    value: 128
+  model.patch_size:
+    values: [1, 2, 4, 8]
   seed:
     values: [0, 1, 2]
   train.learning_rate:
-    values: [0.001, 0.0003]
+    values: [0.003, 0.001, 0.0003]
   train.total_steps:
     value: 10000
   eval.do_rollout:
